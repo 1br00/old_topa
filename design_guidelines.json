@@ -1,0 +1,97 @@
+{
+  "theme": "dark",
+  "archetype": "4 (Swiss & High-Contrast) + Terminal/Technical variant",
+  "typography": {
+    "heading_font": "Azeret Mono",
+    "body_font": "IBM Plex Sans",
+    "font_pairings_rationale": "Azeret Mono brings a stark, technical, terminal-like feel necessary for a cybersecurity tool, while IBM Plex Sans remains legible and objective for dense dashboard data.",
+    "scale": {
+      "h1": "text-4xl sm:text-5xl lg:text-6xl tracking-tighter font-mono",
+      "h2": "text-2xl sm:text-3xl lg:text-4xl tracking-tight font-mono",
+      "h3": "text-xl sm:text-2xl font-mono",
+      "h4": "text-lg sm:text-xl font-mono",
+      "body": "text-base leading-relaxed font-sans",
+      "labels": "text-xs tracking-[0.2em] uppercase font-mono"
+    }
+  },
+  "color_palette": {
+    "backgrounds": {
+      "base": "#0a0a0a",
+      "card": "#121212",
+      "elevated": "#1a1a1a",
+      "glass": "rgba(26, 26, 26, 0.8)"
+    },
+    "text": {
+      "primary": "#f0f2f5",
+      "secondary": "#a0a6ad",
+      "muted": "#737373"
+    },
+    "accents": {
+      "brand": "#4da3ff",
+      "brand_hover": "#80bfff",
+      "healthy": "#00d4aa",
+      "warning": "#ffab00",
+      "critical": "#ff4757"
+    },
+    "borders": {
+      "subtle": "rgba(255,255,255,0.1)",
+      "strong": "rgba(255,255,255,0.2)"
+    },
+    "rules": [
+      "No pure black or white. Use tinted darks.",
+      "Strict avoidance of matrix-green. Use desaturated teal/healthy green and electric blue instead.",
+      "No purple or violet gradients.",
+      "Hover states must be explicitly styled with a lighter hue of the active state."
+    ]
+  },
+  "layout_spacing": {
+    "general_strategy": "Control Room Grid for the Dashboard (dense, clear hierarchy, 1px borders), and Swiss/Bento Grid for Marketing (asymmetry).",
+    "dashboard_grid": "grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-6",
+    "marketing_grid": "grid-cols-1 md:grid-cols-8 lg:grid-cols-12 gap-8 lg:gap-12",
+    "container_padding": "Generous padding on marketing (p-12 to p-24), tight functional padding on dashboard (p-4 to p-6).",
+    "borders": "Expose the skeleton. Use 1px border-border/40 for a 'Technical' look."
+  },
+  "component_styling": {
+    "shape": "Sharp edges, 0px to 2px max border-radius. Avoid soft rounded shapes.",
+    "cards": "Flat background (#121212), 1px subtle border, no heavy drop shadows. Hover triggers a subtle -translate-y-1 and a glow or stronger border.",
+    "buttons": "Primary buttons: bg-[#4da3ff] text-[#0a0a0a] font-bold. Secondary/Outline: border-border text-white hover:bg-white/10.",
+    "glassmorphism": "Used only for floating sticky headers: backdrop-blur-xl bg-[#0a0a0a]/60 border-b border-white/10.",
+    "tables": "Dense rows, monospace font for IP/HWID data, distinct colored status dots.",
+    "shadcn_overrides": "Override Shadcn's default Vercel look (rounded-md, soft shadows). Make components sharp (rounded-none), use thin borders, remove excess padding in tables."
+  },
+  "motion_interactions": {
+    "hover": "Transition transform 0.2s ease, opacity 0.2s ease. Explicit text color changes.",
+    "entrance": "Staggered fade-up for dashboard widgets and list items.",
+    "loading": "Use terminal-like ASCII loaders or simple monospace text 'Scanning...' rather than standard spinners."
+  },
+  "media_and_icons": {
+    "icon_library": "@phosphor-icons/react (Duotone or regular weight for dense technical dashboards)",
+    "image_urls": [
+      {
+        "url": "https://images.unsplash.com/photo-1737505599162-d9932323a889?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA3MDB8MHwxfHNlYXJjaHwxfHxjeWJlcnNlY3VyaXR5JTIwYWJzdHJhY3QlMjBkYXJrJTIwbm9kZXN8ZW58MHx8fHwxNzc4MzA0NTI0fDA&ixlib=rb-4.1.0&q=85",
+        "description": "Abstract dark nodes for the marketing hero section background. Darken with overlay.",
+        "category": "hero_background"
+      },
+      {
+        "url": "https://images.unsplash.com/photo-1763771787035-99c6c28ec78e?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA2MjJ8MHwxfHNlYXJjaHwxfHxzZXJ2ZXIlMjByYWNrJTIwZGFyayUyMGJsdWV8ZW58MHx8fHwxNzc4MzA0NTI0fDA&ixlib=rb-4.1.0&q=85",
+        "description": "Server rack illuminated with blue light. Use in feature cards or 'Downloads' section.",
+        "category": "feature_image"
+      },
+      {
+        "url": "https://images.pexels.com/photos/4065437/pexels-photo-4065437.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+        "description": "Metallic honeycomb grid. Use as subtle background texture with low opacity (10%) on the dashboard or admin panel.",
+        "category": "texture_background"
+      }
+    ],
+    "overlay_rule": "Max bg-black/50 overlay on hero images to ensure readability without killing the visual."
+  },
+  "instructions_to_main_agent": [
+    "You are building a hybrid SaaS tool: Marketing page + Auth + User Dashboard + Admin Panel.",
+    "Use Phosphor Icons (`yarn add @phosphor-icons/react`).",
+    "Use pure HTML + Tailwind for the marketing layout, avoiding rigid Shadcn cards there.",
+    "Use Shadcn UI for forms, dialogs, tables, dropdowns, and dashboard elements.",
+    "Crucial: Ensure every interactive element (buttons, links, inputs, tables, rows) has a `data-testid` attribute using kebab-case role-based naming (e.g., `data-testid=\"login-submit-button\"`, `data-testid=\"download-windows-btn\"`).",
+    "Never use purely transparent headers if content scrolls under them. Use the defined glassmorphism strategy.",
+    "Do not invent placeholder image URLs (no via.placeholder.com). Strictly use the images provided in `media_and_icons`."
+  ]
+}
