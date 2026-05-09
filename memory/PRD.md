@@ -33,6 +33,20 @@ Build a complete SaaS/dashboard system for an XSS scanner tool similar to xss0r.
 - Demo seed: admin, demo user with Pro license + 3 scans + HWID, 2 coupons (LAUNCH50/XSS0R10), 2 build entries
 - 21/21 backend pytest passing; frontend e2e flows verified
 
+## Implemented (2026-02-09 — iteration 2: email + Stripe)
+- **Resend email integration** (`/app/backend/email_service.py`) with templates: password reset, email verification, welcome, payment success, subscription canceled. Async via `asyncio.to_thread`. Falls back to `[EMAIL DRY-RUN]` log when API key is placeholder.
+- **Email verification flow:** `/api/auth/verify-email`, `/api/auth/resend-verification`, frontend `/verify-email?token=...` page
+- **Welcome + verify emails** sent on register
+- **Stripe recurring monthly subscriptions** via `mode=subscription` + inline `price_data.recurring={interval:'month'}`:
+  - `POST /api/stripe/checkout` → returns Stripe Checkout URL (Pro $29 / Enterprise $99)
+  - `GET /api/stripe/checkout-status/{session_id}` → polled by frontend; resilient to Emergent proxy ephemerality (returns cached snapshot if Stripe session not retrievable)
+  - `POST /api/stripe/portal` → Stripe customer portal for cancel/manage card
+  - `POST /api/webhook/stripe` → handles `checkout.session.completed`, `invoice.paid`, `invoice.payment_failed`, `customer.subscription.deleted` with event idempotency (`stripe_events` collection)
+  - On payment success → license auto-extended to `current_period_end`, plan/max_activations updated, payment-success email sent
+  - On cancellation → license status flips to `canceled`/`past_due`, cancellation email sent
+- **Frontend:** `/dashboard/billing` page (3 plan cards with subscribe/switch CTAs, current plan badge, Stripe customer portal button), `/billing/success` (polls status with retry), `/billing/cancel`, sidebar "Billing" link, landing page CTAs say "Subscribe to Pro/Enterprise"
+- 38/38 backend pytest passing (16 new email/stripe tests + 22 regression). Frontend flows verified.
+
 ## Test credentials
 - Admin: `admin@xss0r.io` / `Admin@xss0r2026`
 - User: `user@xss0r.io` / `User@xss0r2026`
