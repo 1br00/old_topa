@@ -22,6 +22,7 @@ import AdminBuilds from "./pages/AdminBuilds";
 import BillingPage from "./pages/BillingPage";
 import BillingSuccess from "./pages/BillingSuccess";
 import BillingCancel from "./pages/BillingCancel";
+import PayPalReturn from "./pages/PayPalReturn";
 import VerifyEmail from "./pages/VerifyEmail";
 import ProtectedRoute from "./components/ProtectedRoute";
 
@@ -56,6 +57,7 @@ function AppRouter() {
         <Route path="/dashboard/billing" element={<ProtectedRoute><BillingPage /></ProtectedRoute>} />
         <Route path="/billing/success" element={<ProtectedRoute><BillingSuccess /></ProtectedRoute>} />
         <Route path="/billing/cancel" element={<ProtectedRoute><BillingCancel /></ProtectedRoute>} />
+        <Route path="/billing/paypal/return" element={<ProtectedRoute><PayPalReturn /></ProtectedRoute>} />
 
         <Route path="/admin" element={<ProtectedRoute adminOnly><AdminStats /></ProtectedRoute>} />
         <Route path="/admin/users" element={<ProtectedRoute adminOnly><AdminUsers /></ProtectedRoute>} />

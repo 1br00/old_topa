@@ -39,6 +39,7 @@ from pydantic import BaseModel, EmailStr, Field
 import io
 
 import email_service as email_svc
+import paypal_service as paypal_svc
 
 # ---------------- Config ----------------
 MONGO_URL = os.environ["MONGO_URL"]
@@ -1048,6 +1049,224 @@ async def stripe_webhook(request: Request):
                         user.get("name", ""), lic.get("expires_at", ""), f"{FRONTEND_URL}/dashboard"
                     )
                     await email_svc.send_email(user["email"], s, h, t)
+
+    return {"ok": True}
+
+
+
+# ---------------- PayPal subscriptions ----------------
+class PayPalSubscribeIn(BaseModel):
+    plan: str  # "pro" | "enterprise"
+    origin_url: str
+
+
+@api.post("/paypal/subscribe")
+async def paypal_subscribe(payload: PayPalSubscribeIn, user: dict = Depends(get_current_user)):
+    if not paypal_svc.is_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="PayPal is not configured. Add PAYPAL_CLIENT_ID and PAYPAL_CLIENT_SECRET to backend env.",
+        )
+    plan = payload.plan.lower()
+    if plan not in PLAN_PRICES:
+        raise HTTPException(status_code=400, detail="Invalid plan")
+    origin = payload.origin_url.rstrip("/")
+    return_url = f"{origin}/billing/paypal/return?plan={plan}"
+    cancel_url = f"{origin}/billing/cancel"
+    custom_id = f"{user['user_id']}|{plan}"
+    try:
+        result = paypal_svc.create_subscription(
+            plan_key=plan,
+            return_url=return_url,
+            cancel_url=cancel_url,
+            custom_id=custom_id,
+            subscriber_email=user.get("email"),
+        )
+    except requests.HTTPError as e:
+        body = ""
+        try:
+            body = e.response.text[:500]
+        except Exception:
+            pass
+        logger.error(f"PayPal create subscription failed: {e} body={body}")
+        raise HTTPException(status_code=502, detail="PayPal error")
+    except Exception as e:
+        logger.error(f"PayPal create subscription error: {e}")
+        raise HTTPException(status_code=502, detail="PayPal unavailable")
+
+    await db.payment_transactions.insert_one({
+        "provider": "paypal",
+        "subscription_id": result["subscription_id"],
+        "user_id": user["user_id"],
+        "email": user["email"],
+        "plan": plan,
+        "amount_cents": PLAN_PRICES[plan]["amount_cents"],
+        "currency": "usd",
+        "payment_status": "initiated",
+        "created_at": iso(now_utc()),
+    })
+    return {
+        "subscription_id": result["subscription_id"],
+        "approval_url": result["approval_url"],
+    }
+
+
+@api.get("/paypal/subscription-status/{subscription_id}")
+async def paypal_subscription_status(subscription_id: str, user: dict = Depends(get_current_user)):
+    if not paypal_svc.is_configured():
+        raise HTTPException(status_code=503, detail="PayPal not configured")
+    txn = await db.payment_transactions.find_one(
+        {"subscription_id": subscription_id, "user_id": user["user_id"]}, {"_id": 0}
+    )
+    if not txn:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    try:
+        sub = paypal_svc.get_subscription(subscription_id)
+    except Exception as e:
+        logger.warning(f"PayPal get_subscription failed for {subscription_id}: {e}")
+        return {"status": txn.get("payment_status", "unknown"), "cached": True}
+
+    status_str = sub.get("status", "")  # APPROVAL_PENDING | ACTIVE | SUSPENDED | CANCELLED
+    await db.payment_transactions.update_one(
+        {"subscription_id": subscription_id},
+        {"$set": {"payment_status": status_str.lower(), "updated_at": iso(now_utc())}},
+    )
+    if status_str == "ACTIVE" and txn.get("payment_status") != "active":
+        await _activate_paypal_subscription(user["user_id"], txn["plan"], subscription_id, sub)
+    return {
+        "status": status_str,
+        "subscription_id": subscription_id,
+        "plan": txn["plan"],
+    }
+
+
+async def _activate_paypal_subscription(user_id: str, plan: str, subscription_id: str, sub_data: dict):
+    cfg = PLAN_PRICES.get(plan)
+    if not cfg:
+        return
+    period_end = None
+    billing_info = sub_data.get("billing_info") or {}
+    next_billing = billing_info.get("next_billing_time")
+    if next_billing:
+        try:
+            period_end = datetime.fromisoformat(next_billing.replace("Z", "+00:00"))
+        except Exception:
+            period_end = None
+    if not period_end:
+        period_end = now_utc() + timedelta(days=30)
+
+    await db.licenses.update_one(
+        {"user_id": user_id},
+        {"$set": {
+            "plan": plan,
+            "status": "active",
+            "expires_at": iso(period_end),
+            "max_activations": cfg["max_activations"],
+            "paypal_subscription_id": subscription_id,
+            "payment_provider": "paypal",
+        }},
+        upsert=True,
+    )
+    user = await db.users.find_one({"user_id": user_id}, {"_id": 0, "password_hash": 0})
+    if user:
+        s, h, t = email_svc.tpl_payment_success(
+            user.get("name", ""), plan, cfg["amount_cents"] / 100,
+            iso(period_end), f"{FRONTEND_URL}/dashboard"
+        )
+        await email_svc.send_email(user["email"], s, h, t)
+
+
+@api.post("/paypal/cancel")
+async def paypal_cancel(payload: dict, user: dict = Depends(get_current_user)):
+    if not paypal_svc.is_configured():
+        raise HTTPException(status_code=503, detail="PayPal not configured")
+    lic = await db.licenses.find_one({"user_id": user["user_id"]}, {"_id": 0})
+    sub_id = lic.get("paypal_subscription_id") if lic else None
+    if not sub_id:
+        raise HTTPException(status_code=400, detail="No active PayPal subscription")
+    try:
+        ok = paypal_svc.cancel_subscription(sub_id, payload.get("reason", "User requested"))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"PayPal cancel failed: {e}")
+    if ok:
+        await db.licenses.update_one(
+            {"user_id": user["user_id"]},
+            {"$set": {"status": "canceled"}},
+        )
+        u = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0, "password_hash": 0})
+        if u:
+            s, h, t = email_svc.tpl_subscription_canceled(
+                u.get("name", ""), lic.get("expires_at", ""), f"{FRONTEND_URL}/dashboard"
+            )
+            await email_svc.send_email(u["email"], s, h, t)
+    return {"ok": ok}
+
+
+@api.post("/webhook/paypal")
+async def paypal_webhook(request: Request):
+    raw = await request.body()
+    raw_str = raw.decode("utf-8", errors="ignore")
+    if not paypal_svc.verify_webhook(dict(request.headers), raw_str):
+        logger.warning("PayPal webhook signature verification failed")
+        # Still log but reject
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    import json as _json
+    try:
+        event = _json.loads(raw_str)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    event_id = event.get("id")
+    event_type = event.get("event_type", "")
+    resource = event.get("resource") or {}
+
+    # Idempotency
+    if event_id and await db.paypal_events.find_one({"event_id": event_id}):
+        return {"ok": True, "duplicate": True}
+    if event_id:
+        await db.paypal_events.insert_one({
+            "event_id": event_id, "type": event_type, "received_at": iso(now_utc())
+        })
+
+    if event_type in ("BILLING.SUBSCRIPTION.ACTIVATED", "BILLING.SUBSCRIPTION.CREATED"):
+        sub_id = resource.get("id")
+        custom_id = resource.get("custom_id", "")
+        if "|" in custom_id:
+            user_id, plan = custom_id.split("|", 1)
+            if sub_id and user_id and plan in PLAN_PRICES:
+                await _activate_paypal_subscription(user_id, plan, sub_id, resource)
+
+    elif event_type == "PAYMENT.SALE.COMPLETED":
+        # Extend license on each successful renewal
+        sub_id = resource.get("billing_agreement_id")
+        if sub_id:
+            lic = await db.licenses.find_one({"paypal_subscription_id": sub_id}, {"_id": 0})
+            if lic:
+                try:
+                    sub = paypal_svc.get_subscription(sub_id)
+                    await _activate_paypal_subscription(lic["user_id"], lic["plan"], sub_id, sub)
+                except Exception as e:
+                    logger.error(f"PAYMENT.SALE.COMPLETED handling failed: {e}")
+
+    elif event_type in ("BILLING.SUBSCRIPTION.CANCELLED", "BILLING.SUBSCRIPTION.SUSPENDED",
+                        "BILLING.SUBSCRIPTION.EXPIRED", "PAYMENT.SALE.DENIED"):
+        sub_id = resource.get("id") or resource.get("billing_agreement_id")
+        if sub_id:
+            lic = await db.licenses.find_one({"paypal_subscription_id": sub_id}, {"_id": 0})
+            if lic:
+                new_status = "canceled" if event_type == "BILLING.SUBSCRIPTION.CANCELLED" else "past_due"
+                await db.licenses.update_one(
+                    {"user_id": lic["user_id"]},
+                    {"$set": {"status": new_status}},
+                )
+                if event_type == "BILLING.SUBSCRIPTION.CANCELLED":
+                    u = await db.users.find_one({"user_id": lic["user_id"]}, {"_id": 0, "password_hash": 0})
+                    if u:
+                        s, h, t = email_svc.tpl_subscription_canceled(
+                            u.get("name", ""), lic.get("expires_at", ""), f"{FRONTEND_URL}/dashboard"
+                        )
+                        await email_svc.send_email(u["email"], s, h, t)
 
     return {"ok": True}
 
