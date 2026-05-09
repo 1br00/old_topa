@@ -63,10 +63,39 @@ stripe.api_key = STRIPE_API_KEY
 if STRIPE_API_KEY and "sk_test_emergent" in STRIPE_API_KEY:
     stripe.api_base = "https://integrations.emergentagent.com/stripe"
 
-# Plan -> price config (USD/month). Used for inline price_data on Checkout.
+# Plan -> price config. amount_cents charged per billing cycle.
+# duration = how long one cycle covers; max_activations = devices.
 PLAN_PRICES = {
-    "pro": {"name": "xss0r Pro", "amount_cents": 2900, "max_activations": 3},
-    "enterprise": {"name": "xss0r Enterprise", "amount_cents": 9900, "max_activations": 10},
+    "basic": {
+        "name": "xss0r Basic",
+        "amount_cents": 1999,
+        "max_activations": 3,
+        "interval": "month", "interval_count": 1, "duration_days": 30,
+    },
+    "pro": {
+        "name": "xss0r Pro",
+        "amount_cents": 4999,
+        "max_activations": 3,
+        "interval": "month", "interval_count": 1, "duration_days": 30,
+    },
+    "diamond": {
+        "name": "xss0r Diamond",
+        "amount_cents": 8999,
+        "max_activations": 4,
+        "interval": "month", "interval_count": 3, "duration_days": 90,
+    },
+    "golden": {
+        "name": "xss0r Golden",
+        "amount_cents": 11999,
+        "max_activations": 5,
+        "interval": "month", "interval_count": 6, "duration_days": 180,
+    },
+    "business": {
+        "name": "xss0r Business",
+        "amount_cents": 33999,
+        "max_activations": 18,
+        "interval": "year", "interval_count": 1, "duration_days": 365,
+    },
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -279,13 +308,15 @@ async def _ensure_license(user_id: str, plan: str = "free", days: int = 0) -> di
     if existing:
         return existing
     expiry = now_utc() + timedelta(days=days) if days > 0 else None
+    cfg = PLAN_PRICES.get(plan, {})
+    max_act = cfg.get("max_activations", 1) if plan != "free" else 1
     lic = {
         "license_id": f"lic_{uuid.uuid4().hex[:12]}",
         "user_id": user_id,
         "plan": plan,
         "status": "active" if (days > 0 or plan == "free") else "inactive",
         "expires_at": iso(expiry) if expiry else None,
-        "max_activations": 1 if plan == "free" else 3 if plan == "pro" else 10,
+        "max_activations": max_act,
         "created_at": iso(now_utc()),
     }
     await db.licenses.insert_one(lic)
@@ -833,7 +864,10 @@ async def stripe_checkout(payload: CheckoutIn, user: dict = Depends(get_current_
                     "currency": "usd",
                     "product_data": {"name": cfg["name"]},
                     "unit_amount": cfg["amount_cents"],
-                    "recurring": {"interval": "month"},
+                    "recurring": {
+                        "interval": cfg["interval"],
+                        "interval_count": cfg["interval_count"],
+                    },
                 },
                 "quantity": 1,
             }],
@@ -928,7 +962,7 @@ async def _activate_subscription(user_id: str, plan: str, subscription_id: Optio
         except Exception as e:
             logger.error(f"sub retrieve failed: {e}")
     if not period_end:
-        period_end = now_utc() + timedelta(days=30)
+        period_end = now_utc() + timedelta(days=cfg.get("duration_days", 30))
     await db.licenses.update_one(
         {"user_id": user_id},
         {"$set": {
@@ -937,6 +971,7 @@ async def _activate_subscription(user_id: str, plan: str, subscription_id: Optio
             "expires_at": iso(period_end),
             "max_activations": cfg["max_activations"],
             "stripe_subscription_id": subscription_id,
+            "payment_provider": "stripe",
         }},
         upsert=True,
     )
@@ -1276,14 +1311,106 @@ async def paypal_webhook(request: Request):
 @api.get("/plans")
 async def get_plans():
     return [
-        {"id": "free", "name": "Free", "price": 0, "period": "14d trial",
-         "features": ["1 device", "Basic XSS scanner", "Community support", "Limited scan history"]},
-        {"id": "pro", "name": "Pro", "price": 29, "period": "month",
-         "features": ["3 devices", "Full XSS engine + DOM", "API access", "Priority support",
-                      "Unlimited scan history", "Auto updates"]},
-        {"id": "enterprise", "name": "Enterprise", "price": 99, "period": "month",
-         "features": ["10 devices", "Advanced payloads", "CI/CD integration", "Dedicated support",
-                      "SLA + audit logs", "Custom payload library"]},
+        {
+            "id": "basic",
+            "name": "Basic",
+            "tier": 1,
+            "price": 19.99,
+            "period": "month",
+            "duration_label": "1 month",
+            "color": "#737373",
+            "popular": False,
+            "section_title": "FLAGS / FEATURES",
+            "features": [
+                "Get", "Post", "Only alerts", "Reflection", "Suffix", "Prefix",
+                "Fullscan", "CRLF", "FilenameXss", "Hash-XSS",
+                "Screenshot (proof)", "Path Injection", "Clear URL List",
+            ],
+            "limits": {"Threads": "7", "Payloads": "1500", "Devices": "3", "Duration": "1 month"},
+            "savings": None,
+            "monthly_equiv": None,
+        },
+        {
+            "id": "pro",
+            "name": "Pro",
+            "tier": 2,
+            "price": 49.99,
+            "period": "month",
+            "duration_label": "1 month",
+            "color": "#2b6cf2",
+            "popular": False,
+            "section_title": "Includes everything from BASIC plus:",
+            "features": [
+                "Recon", "Inspector", "Path", "Resume", "Cookies", "Initialize",
+                "Spray", "Save Scan Sessions", "Directory Scanning",
+                "Report screenshots (advanced)", "Bug Bounty Mode",
+            ],
+            "limits": {"Threads": "10", "Payloads": "2000", "Devices": "3", "Duration": "1 month"},
+            "savings": None,
+            "monthly_equiv": None,
+        },
+        {
+            "id": "diamond",
+            "name": "Diamond",
+            "tier": 3,
+            "price": 89.99,
+            "period": "3 months",
+            "duration_label": "3 months",
+            "color": "#7c5cff",
+            "popular": True,
+            "popular_label": "MOST POPULAR",
+            "section_title": "Includes everything from PRO plus:",
+            "features": [
+                "Stealth", "Blindusername", "Crawler", "Fuzzer", "Limit",
+                "Clickme", "Wayback", "Formscan", "Subdomains",
+                "ParamBrute", "Dirscan", "Filter",
+            ],
+            "limits": {"Threads": "13", "Payloads": "3000", "Devices": "4", "Duration": "3 months"},
+            "savings": "Save: $239.92 compared to PRO plan on a yearly basis",
+            "monthly_equiv": "≈ $30.00 / month (billed every 3 months)",
+        },
+        {
+            "id": "golden",
+            "name": "Golden",
+            "tier": 4,
+            "price": 119.99,
+            "period": "6 months",
+            "duration_label": "6 months",
+            "color": "#f5a623",
+            "popular": False,
+            "section_title": "Includes everything from DIAMOND plus:",
+            "features": [
+                "Custom Headers", "All (combined mode)", "User Agent",
+                "Include-params", "Exclude-params", "Dirscan +2",
+                "Code-analysis", "Code-vuln",
+            ],
+            "limits": {"Threads": "15", "Payloads": "Unlimited", "Devices": "5", "Duration": "6 months"},
+            "savings": "Save: $359.90 compared to PRO plan on a yearly basis",
+            "monthly_equiv": "≈ $20.00 / month (billed every 6 months)",
+        },
+        {
+            "id": "business",
+            "name": "Business",
+            "tier": 5,
+            "price": 339.99,
+            "period": "1 year",
+            "duration_label": "1 year",
+            "color": "#10b981",
+            "popular": False,
+            "popular_label": "TEAMS & ENTERPRISE",
+            "section_title": "Includes everything from GOLDEN plus:",
+            "features": [
+                "Multi-user capability",
+                "Enterprise scaling",
+                "Dynamic threads",
+            ],
+            "limits": {
+                "Threads": "Unlimited", "Payloads": "Unlimited", "Total licenses": "3",
+                "Support": "24/7", "Devices": "18", "Duration": "1 year",
+            },
+            "savings": "Save: $259.89 compared to PRO plan on a yearly basis",
+            "monthly_equiv": "≈ $28.33 / month (billed annually)",
+        },
     ]
 
 
@@ -1303,7 +1430,7 @@ async def seed_demo():
             "banned": False,
             "created_at": iso(now_utc()),
         })
-        await _ensure_license(admin_id, plan="enterprise", days=3650)
+        await _ensure_license(admin_id, plan="business", days=3650)
         logger.info(f"Seeded admin {ADMIN_EMAIL}")
     else:
         if not verify_password(ADMIN_PASSWORD, admin.get("password_hash", "")):

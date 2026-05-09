@@ -134,13 +134,23 @@ def test_stripe_checkout_pro(user_s):
     assert "session_id" in data
 
 
-def test_stripe_checkout_enterprise(user_s):
+@pytest.mark.parametrize("plan", ["basic", "pro", "diamond", "golden", "business"])
+def test_stripe_checkout_all_plans(user_s, plan):
     r = user_s.post(f"{BASE}/api/stripe/checkout", json={
-        "plan": "enterprise",
+        "plan": plan,
         "origin_url": BASE,
     })
     assert r.status_code == 200, r.text
     assert r.json()["checkout_url"].startswith("https://checkout.stripe.com")
+
+
+@pytest.mark.parametrize("plan", ["enterprise", "free", "foo"])
+def test_stripe_checkout_removed_plans_400(user_s, plan):
+    r = user_s.post(f"{BASE}/api/stripe/checkout", json={
+        "plan": plan,
+        "origin_url": BASE,
+    })
+    assert r.status_code == 400, f"plan {plan} expected 400, got {r.status_code}: {r.text}"
 
 
 def test_stripe_checkout_invalid_plan(user_s):
@@ -179,8 +189,8 @@ def test_stripe_checkout_status_pro(user_s):
 
 
 # -------- Stripe checkout-status (Enterprise) - must NEVER be 500 --------
-def test_stripe_checkout_status_enterprise(user_s):
-    r = user_s.post(f"{BASE}/api/stripe/checkout", json={"plan": "enterprise", "origin_url": BASE})
+def test_stripe_checkout_status_business(user_s):
+    r = user_s.post(f"{BASE}/api/stripe/checkout", json={"plan": "business", "origin_url": BASE})
     assert r.status_code == 200
     sid = r.json()["session_id"]
     r2 = user_s.get(f"{BASE}/api/stripe/checkout-status/{sid}")
@@ -217,7 +227,7 @@ def test_webhook_checkout_session_completed_and_idempotent(mongo_db):
         "data": {
             "object": {
                 "id": session_id,
-                "metadata": {"user_id": user_id, "plan": "enterprise"},
+                "metadata": {"user_id": user_id, "plan": "business"},
                 "subscription": sub_id,
             }
         },
@@ -227,11 +237,13 @@ def test_webhook_checkout_session_completed_and_idempotent(mongo_db):
     assert r.json().get("ok") is True
     assert r.json().get("duplicate") is not True
 
-    # License should be enterprise + carry stripe_subscription_id
+    # License should be business + carry stripe_subscription_id
     lic = mongo_db.licenses.find_one({"user_id": user_id})
     assert lic is not None
-    assert lic.get("plan") == "enterprise"
+    assert lic.get("plan") == "business"
     assert lic.get("stripe_subscription_id") == sub_id
+    assert lic.get("max_activations") == 18
+    assert lic.get("payment_provider") == "stripe"
 
     # Replay same event -> duplicate
     r2 = requests.post(f"{BASE}/api/webhook/stripe", json=payload)

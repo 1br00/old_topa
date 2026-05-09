@@ -1,0 +1,55 @@
+{
+  "summary": "Iteration 5 — verified 5-plan structure (basic/pro/diamond/golden/business) replacing previous 3-plan free/pro/enterprise. 78/80 backend tests passing. 2 failures expose a real backend bug: _activate_paypal_subscription uses a hardcoded 30-day fallback instead of plan-specific duration_days when next_billing_time is missing, so diamond and business webhook activations get a 30-day expiry instead of 90/365. All other claims in the review request verified (GET /api/plans shape, Stripe checkout for all 5 plans + recurring interval persistence, 400 for enterprise/free/foo, demo user='pro', admin='business' [migration confirmed], PayPal 503 for all 5 plans, max_activations correctly set to 4 [diamond] / 18 [business], payment_provider='paypal' on license, regression auth/license/stats/coupon all green). Frontend Landing /#pricing renders 2-2-1 grid (BASIC gray, PRO blue, DIAMOND purple+MOST POPULAR, GOLDEN orange, BUSINESS green centered) — matches screenshot spec. Dashboard Billing page shows CURRENT PLAN on PRO + 4 SELECT buttons + 4 'OR PAY WITH PAYPAL' secondary buttons.",
+  "backend_issues": {
+    "critical": [
+      {
+        "endpoint": "POST /api/webhook/paypal (BILLING.SUBSCRIPTION.ACTIVATED → _activate_paypal_subscription)",
+        "issue": "Hardcoded 30-day fallback for license expires_at when billing_info.next_billing_time is missing. server.py line ~1191: 'period_end = now_utc() + timedelta(days=30)'. For diamond/golden/business this gives a wrong expiry (should be 90/180/365). Fix: replace with cfg.get('duration_days', 30) — same pattern Stripe's _activate_subscription already uses correctly on line 965.",
+        "priority": "HIGH"
+      }
+    ],
+    "minor": [
+      {
+        "endpoint": "POST /api/stripe/checkout",
+        "issue": "CheckoutIn.plan docstring still says '\"pro\" | \"enterprise\"' (server.py line 818). Plan names changed but the inline comment was not updated. Same on PayPalSubscribeIn line 1095."
+      }
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_plans_5tier.py",
+    "/app/backend/tests/test_email_stripe.py",
+    "/app/backend/tests/test_paypal.py",
+    "/app/backend/tests/test_xss0r_api.py",
+    "/app/test_reports/pytest/iteration_5.xml",
+    "/app/test_reports/pytest/iteration_5_plans.xml"
+  ],
+  "action_items": [
+    "[HIGH] Fix _activate_paypal_subscription duration_days fallback in server.py (~line 1191): change 'period_end = now_utc() + timedelta(days=30)' to 'period_end = now_utc() + timedelta(days=cfg.get(\"duration_days\", 30))'. After fix, re-run pytest backend/tests/test_plans_5tier.py::test_paypal_webhook_activates_correct_plan to confirm both diamond and business cases get correct expiry (~90 and ~365 days).",
+    "[LOW] Update docstring comments on CheckoutIn.plan and PayPalSubscribeIn.plan to reflect new plan keys (basic/pro/diamond/golden/business).",
+    "[LOW carry-over] server.py is now ~1549 lines — consider splitting routers (auth, stripe, paypal, admin, plans) into separate modules per >700-line guideline.",
+    "[LOW carry-over] paypal_service.verify_webhook returns True when PAYPAL_WEBHOOK_ID empty — fail-closed in production."
+  ],
+  "critical_code_review_comments": [
+    "Stripe _activate_subscription correctly uses cfg.get('duration_days', 30) but PayPal counterpart hardcodes 30 — duplicated logic that has drifted (DRY violation). Extract a helper.",
+    "PLAN_PRICES.duration_days for golden=180 maps to 'period: 6 months' label and Stripe interval_count=6 — internally consistent; please verify business=365 vs interval=year/interval_count=1 consistency on production Stripe (year billing in Stripe means 1y, so OK).",
+    "GET /api/plans returns hardcoded list — fine for now, but ensure prices in PLAN_PRICES (cents) and api/plans (dollars) stay in sync; today they do (1999/4999/8999/11999/33999 cents ↔ 19.99/49.99/89.99/119.99/339.99). Consider single source of truth.",
+    "_ensure_license sets max_activations from PLAN_PRICES, but for plan='free' it forces max_activations=1 ignoring config — explicit override looks intentional but code comment would help."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_plans_5tier.py (new, 27 tests)",
+    "/app/backend/tests/test_email_stripe.py (parametrized test_stripe_checkout_all_plans + removed-plan 400 cases; renamed enterprise→business)",
+    "/app/backend/tests/test_xss0r_api.py (test_plans_public expectation updated to 5 plan ids)"
+  ],
+  "success_rate": {"backend": "97.5% (78/80) — 2 failures both expose the same PayPal duration bug", "frontend": "100% (Landing 2-2-1 grid + Billing CURRENT/SELECT/PayPal buttons all verified)"},
+  "test_credentials": "user@xss0r.io / User@xss0r2026 (plan=pro), admin@xss0r.io / Admin@xss0r2026 (plan=business — migration verified)",
+  "seed_data_creation": "test_plans_5tier.py reuses seeded users; test_paypal_webhook_activates_correct_plan saves orig license snapshot and restores in finally block (try/finally added during this iteration to prevent leaking state into subsequent tests).",
+  "retest_needed": true,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Apply the one-line fix for PayPal duration_days fallback then re-run: pytest backend/tests/test_plans_5tier.py::test_paypal_webhook_activates_correct_plan -v. Full regression: pytest backend/tests/. Stripe interval persistence is verified indirectly via the persisted payment_transactions.amount_cents check; if you want stronger validation, intercept the stripe.checkout.Session.create call args (mock) — currently the Emergent test proxy doesn't expose price_data introspection on retrieval. Frontend was verified visually — full screenshot saved during this iteration confirms the 2-2-1 grid and color stripes.",
+  "rca of the issue": "Bug: PayPal webhook activation expiry is hardcoded 30 days. Reproduction: POST /api/webhook/paypal with event_type=BILLING.SUBSCRIPTION.ACTIVATED and resource without billing_info.next_billing_time, custom_id='<user_id>|diamond' → license.expires_at is set to now+30d instead of now+90d. Same for golden (now+30d vs +180d) and business (now+30d vs +365d). Root cause: server.py _activate_paypal_subscription falls back to a literal `timedelta(days=30)` instead of using `cfg.get('duration_days', 30)` like the Stripe counterpart does. Mitigation: one-line change in server.py (~line 1191). After fix, both new test_paypal_webhook_activates_correct_plan parametrize cases will pass, bringing the suite to 80/80."
+}

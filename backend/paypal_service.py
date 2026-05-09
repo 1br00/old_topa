@@ -29,8 +29,26 @@ API_BASE = (
 )
 
 PLAN_CONFIG = {
-    "pro": {"name": "xss0r Pro", "description": "xss0r Pro monthly subscription", "price": "29.00"},
-    "enterprise": {"name": "xss0r Enterprise", "description": "xss0r Enterprise monthly subscription", "price": "99.00"},
+    "basic": {
+        "name": "xss0r Basic", "description": "xss0r Basic — monthly",
+        "price": "19.99", "interval_unit": "MONTH", "interval_count": 1,
+    },
+    "pro": {
+        "name": "xss0r Pro", "description": "xss0r Pro — monthly",
+        "price": "49.99", "interval_unit": "MONTH", "interval_count": 1,
+    },
+    "diamond": {
+        "name": "xss0r Diamond", "description": "xss0r Diamond — every 3 months",
+        "price": "89.99", "interval_unit": "MONTH", "interval_count": 3,
+    },
+    "golden": {
+        "name": "xss0r Golden", "description": "xss0r Golden — every 6 months",
+        "price": "119.99", "interval_unit": "MONTH", "interval_count": 6,
+    },
+    "business": {
+        "name": "xss0r Business", "description": "xss0r Business — annual",
+        "price": "339.99", "interval_unit": "YEAR", "interval_count": 1,
+    },
 }
 
 # Cache: plan_key -> paypal_plan_id, fetched/created lazily
@@ -94,7 +112,7 @@ def ensure_plan(plan_key: str) -> str:
     product.raise_for_status()
     product_id = product.json()["id"]
 
-    # 2) Create monthly recurring Plan
+    # 2) Create recurring Plan with plan-specific frequency
     plan = requests.post(
         f"{API_BASE}/v1/billing/plans",
         headers=_auth_headers(),
@@ -103,7 +121,10 @@ def ensure_plan(plan_key: str) -> str:
             "name": cfg["name"],
             "description": cfg["description"],
             "billing_cycles": [{
-                "frequency": {"interval_unit": "MONTH", "interval_count": 1},
+                "frequency": {
+                    "interval_unit": cfg.get("interval_unit", "MONTH"),
+                    "interval_count": cfg.get("interval_count", 1),
+                },
                 "tenure_type": "REGULAR",
                 "sequence": 1,
                 "total_cycles": 0,  # 0 = unlimited (auto-renew forever)

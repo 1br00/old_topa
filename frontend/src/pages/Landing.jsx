@@ -1,20 +1,25 @@
 import { Link } from "react-router-dom";
 import { Button } from "../components/ui/button";
+import PlanCard from "../components/PlanCard";
 import { useEffect, useState } from "react";
 import axios from "axios";
 import {
   ShieldCheck, Lightning, Key, Cpu, Code, Terminal,
   Bug, GitBranch, Lock, ArrowRight, CheckCircle, ListChecks
 } from "@phosphor-icons/react";
+import { useNavigate } from "react-router-dom";
 
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
 
 export default function Landing() {
   const [plans, setPlans] = useState([]);
+  const navigate = useNavigate();
 
   useEffect(() => {
     axios.get(`${API}/plans`).then((r) => setPlans(r.data)).catch(() => {});
   }, []);
+
+  const goPlan = (planId) => navigate(`/register?plan=${planId}`);
 
   return (
     <div className="min-h-screen bg-[#0a0a0a] text-[#f0f2f5]">
@@ -149,44 +154,29 @@ export default function Landing() {
         <div className="relative max-w-7xl mx-auto px-6">
           <div className="mb-16 text-center">
             <span className="label-tech">/ pricing</span>
-            <h2 className="font-mono font-bold text-3xl lg:text-4xl mt-3 mb-3 tracking-tight">Simple, license-locked.</h2>
-            <p className="text-[#a0a6ad]">One license. Multiple devices. Reset HWID anytime.</p>
+            <h2 className="font-mono font-bold text-3xl lg:text-4xl mt-3 mb-3 tracking-tight">Five tiers. Pick your power.</h2>
+            <p className="text-[#a0a6ad]">Monthly to annual licenses. Card or PayPal. Cancel anytime.</p>
           </div>
-          <div className="grid md:grid-cols-3 gap-6">
-            {plans.map((p, idx) => (
-              <div
-                key={p.id}
-                data-testid={`plan-${p.id}`}
-                className={`card-tech p-8 relative ${p.id === "pro" ? "border-[#4da3ff]/40 lg:scale-105 lg:-mt-2" : ""}`}
-              >
-                {p.id === "pro" && (
-                  <span className="absolute top-0 right-0 bg-[#4da3ff] text-[#0a0a0a] text-xs font-mono px-3 py-1 font-bold">RECOMMENDED</span>
-                )}
-                <h3 className="font-mono font-bold text-2xl mb-1">{p.name}</h3>
-                <p className="text-xs label-tech mb-6">/ {p.id}</p>
-                <div className="mb-8">
-                  <span className="text-5xl font-mono font-bold">${p.price}</span>
-                  <span className="text-[#a0a6ad] text-sm ml-2">/ {p.period}</span>
-                </div>
-                <ul className="space-y-3 mb-8">
-                  {p.features.map((f, i) => (
-                    <li key={i} className="flex items-start gap-2 text-sm text-[#a0a6ad]">
-                      <CheckCircle size={16} className="text-[#00d4aa] mt-0.5 flex-shrink-0" weight="fill" />
-                      <span>{f}</span>
-                    </li>
-                  ))}
-                </ul>
-                <Link to="/register" data-testid={`plan-${p.id}-cta`}>
-                  <Button
-                    className={`w-full rounded-none h-11 ${
-                      p.id === "pro" ? "btn-primary" : "bg-white/5 hover:bg-white/10 text-white border border-white/20"
-                    }`}
-                  >
-                    {p.price === 0 ? "Start trial" : "Subscribe to " + p.name}
-                  </Button>
-                </Link>
-              </div>
+
+          {/* Top row: Basic + Pro */}
+          <div className="grid md:grid-cols-2 gap-6 mb-6">
+            {plans.slice(0, 2).map((p) => (
+              <PlanCard key={p.id} plan={p} onClick={() => goPlan(p.id)} />
             ))}
+          </div>
+          {/* Mid row: Diamond + Golden */}
+          <div className="grid md:grid-cols-2 gap-6 mb-6">
+            {plans.slice(2, 4).map((p) => (
+              <PlanCard key={p.id} plan={p} onClick={() => goPlan(p.id)} />
+            ))}
+          </div>
+          {/* Bottom: Business centered */}
+          <div className="grid md:grid-cols-3 gap-6">
+            <div className="hidden md:block" />
+            {plans.slice(4, 5).map((p) => (
+              <PlanCard key={p.id} plan={p} onClick={() => goPlan(p.id)} />
+            ))}
+            <div className="hidden md:block" />
           </div>
         </div>
       </section>

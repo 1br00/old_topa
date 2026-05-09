@@ -35,7 +35,7 @@ def test_plans_public():
     assert r.status_code == 200
     plans = r.json()
     ids = {p["id"] for p in plans}
-    assert ids == {"free", "pro", "enterprise"}
+    assert ids == {"basic", "pro", "diamond", "golden", "business"}
 
 
 def test_register_login_me_logout():
