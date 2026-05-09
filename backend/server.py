@@ -814,7 +814,7 @@ async def admin_delete_build(build_id: str, user: dict = Depends(require_admin))
 
 # ---------------- Stripe subscriptions ----------------
 class CheckoutIn(BaseModel):
-    plan: str  # "pro" | "enterprise"
+    plan: str  # "basic" | "pro" | "diamond" | "golden" | "business"
     origin_url: str  # window.location.origin from frontend
 
 
@@ -1091,7 +1091,7 @@ async def stripe_webhook(request: Request):
 
 # ---------------- PayPal subscriptions ----------------
 class PayPalSubscribeIn(BaseModel):
-    plan: str  # "pro" | "enterprise"
+    plan: str  # "basic" | "pro" | "diamond" | "golden" | "business"
     origin_url: str
 
 
@@ -1188,7 +1188,7 @@ async def _activate_paypal_subscription(user_id: str, plan: str, subscription_id
         except Exception:
             period_end = None
     if not period_end:
-        period_end = now_utc() + timedelta(days=30)
+        period_end = now_utc() + timedelta(days=cfg.get("duration_days", 30))
 
     await db.licenses.update_one(
         {"user_id": user_id},
