@@ -67,6 +67,11 @@ export default function Dashboard() {
             <Stat label="Days remaining" value={remaining ?? "∞"} />
           </div>
           <div className="grid sm:grid-cols-3 gap-4 mt-8 pt-6 border-t border-white/10">
+            <Link to="/dashboard/billing" data-testid="quick-billing">
+              <Button variant="outline" className="rounded-none h-11 w-full border-white/15 hover:bg-white/5 hover:text-white justify-start">
+                <ShieldCheck size={16} className="mr-2" /> Upgrade plan
+              </Button>
+            </Link>
             <Link to="/dashboard/license" data-testid="quick-license">
               <Button variant="outline" className="rounded-none h-11 w-full border-white/15 hover:bg-white/5 hover:text-white justify-start">
                 <Key size={16} className="mr-2" /> API key & HWID
@@ -75,11 +80,6 @@ export default function Dashboard() {
             <Link to="/dashboard/downloads" data-testid="quick-downloads">
               <Button variant="outline" className="rounded-none h-11 w-full border-white/15 hover:bg-white/5 hover:text-white justify-start">
                 <Download size={16} className="mr-2" /> Downloads
-              </Button>
-            </Link>
-            <Link to="/dashboard/coupons" data-testid="quick-coupons">
-              <Button variant="outline" className="rounded-none h-11 w-full border-white/15 hover:bg-white/5 hover:text-white justify-start">
-                <Calendar size={16} className="mr-2" /> Redeem coupon
               </Button>
             </Link>
           </div>

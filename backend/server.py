@@ -27,6 +27,7 @@ from typing import List, Optional
 import bcrypt
 import jwt
 import requests
+import stripe
 from fastapi import (
     FastAPI, APIRouter, HTTPException, Depends, Request, Response,
     UploadFile, File, Form, Header
@@ -36,6 +37,8 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, EmailStr, Field
 import io
+
+import email_service as email_svc
 
 # ---------------- Config ----------------
 MONGO_URL = os.environ["MONGO_URL"]
@@ -52,6 +55,18 @@ STORAGE_URL = "https://integrations.emergentagent.com/objstore/api/v1/storage"
 EMERGENT_AUTH_SESSION_URL = (
     "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data"
 )
+
+# Stripe
+STRIPE_API_KEY = os.environ.get("STRIPE_API_KEY", "")
+stripe.api_key = STRIPE_API_KEY
+if STRIPE_API_KEY and "sk_test_emergent" in STRIPE_API_KEY:
+    stripe.api_base = "https://integrations.emergentagent.com/stripe"
+
+# Plan -> price config (USD/month). Used for inline price_data on Checkout.
+PLAN_PRICES = {
+    "pro": {"name": "xss0r Pro", "amount_cents": 2900, "max_activations": 3},
+    "enterprise": {"name": "xss0r Enterprise", "amount_cents": 9900, "max_activations": 10},
+}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("xss0r")
@@ -297,15 +312,70 @@ async def register(payload: RegisterIn, response: Response):
         "role": "user",
         "auth_provider": "password",
         "banned": False,
+        "email_verified": False,
         "picture": None,
         "created_at": iso(now_utc()),
     }
     await db.users.insert_one(doc)
     await _ensure_license(user_id, plan="free", days=14)
+
+    # Email: send welcome + verification link
+    verify_token = secrets.token_urlsafe(32)
+    await db.email_verify_tokens.insert_one({
+        "token": verify_token,
+        "user_id": user_id,
+        "expires_at": now_utc() + timedelta(days=7),
+        "used": False,
+    })
+    verify_link = f"{FRONTEND_URL}/verify-email?token={verify_token}"
+    dashboard_url = f"{FRONTEND_URL}/dashboard"
+    try:
+        s, h, t = email_svc.tpl_welcome(payload.name, dashboard_url)
+        await email_svc.send_email(email, s, h, t)
+        s, h, t = email_svc.tpl_verify_email(payload.name, verify_link)
+        await email_svc.send_email(email, s, h, t)
+    except Exception as e:
+        logger.error(f"register email send failed: {e}")
+
     access = create_access_token(user_id, email)
     refresh = create_refresh_token(user_id)
     set_jwt_cookies(response, access, refresh)
     return {"user_id": user_id, "email": email, "name": payload.name, "role": "user"}
+
+
+@api.post("/auth/verify-email")
+async def verify_email(payload: dict):
+    token = payload.get("token", "")
+    rec = await db.email_verify_tokens.find_one({"token": token, "used": False}, {"_id": 0})
+    if not rec:
+        raise HTTPException(status_code=400, detail="Invalid or used token")
+    exp = rec["expires_at"]
+    if isinstance(exp, str):
+        exp = datetime.fromisoformat(exp)
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    if exp < now_utc():
+        raise HTTPException(status_code=400, detail="Token expired")
+    await db.users.update_one({"user_id": rec["user_id"]}, {"$set": {"email_verified": True}})
+    await db.email_verify_tokens.update_one({"token": token}, {"$set": {"used": True}})
+    return {"ok": True}
+
+
+@api.post("/auth/resend-verification")
+async def resend_verification(user: dict = Depends(get_current_user)):
+    if user.get("email_verified"):
+        return {"ok": True, "already_verified": True}
+    token = secrets.token_urlsafe(32)
+    await db.email_verify_tokens.insert_one({
+        "token": token,
+        "user_id": user["user_id"],
+        "expires_at": now_utc() + timedelta(days=7),
+        "used": False,
+    })
+    link = f"{FRONTEND_URL}/verify-email?token={token}"
+    s, h, t = email_svc.tpl_verify_email(user.get("name", ""), link)
+    await email_svc.send_email(user["email"], s, h, t)
+    return {"ok": True}
 
 
 @api.post("/auth/login")
@@ -406,6 +476,8 @@ async def forgot_password(payload: ForgotIn):
         })
         reset_link = f"{FRONTEND_URL}/reset-password?token={token}"
         logger.info(f"[PASSWORD RESET] {email} -> {reset_link}")
+        subject, html, text = email_svc.tpl_password_reset(user.get("name", ""), reset_link)
+        await email_svc.send_email(email, subject, html, text)
     return {"ok": True, "message": "If the email exists, a reset link has been sent."}
 
 
@@ -706,6 +778,266 @@ async def admin_delete_build(build_id: str, user: dict = Depends(require_admin))
     if res.matched_count == 0:
         raise HTTPException(status_code=404, detail="Build not found")
     return {"ok": True}
+
+
+# ---------------- Stripe subscriptions ----------------
+class CheckoutIn(BaseModel):
+    plan: str  # "pro" | "enterprise"
+    origin_url: str  # window.location.origin from frontend
+
+
+def _ensure_stripe_customer(user: dict) -> str:
+    """Return Stripe customer_id, creating one if missing or stale."""
+    existing = user.get("stripe_customer_id")
+    if existing:
+        try:
+            cust = stripe.Customer.retrieve(existing)
+            if not getattr(cust, "deleted", False):
+                return existing
+        except stripe.error.StripeError:
+            # Stale id (test env reset) — recreate below
+            pass
+    cust = stripe.Customer.create(
+        email=user["email"],
+        name=user.get("name") or user["email"],
+        metadata={"user_id": user["user_id"]},
+    )
+    return cust.id
+
+
+@api.post("/stripe/checkout")
+async def stripe_checkout(payload: CheckoutIn, user: dict = Depends(get_current_user)):
+    if not STRIPE_API_KEY:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+    plan = payload.plan.lower()
+    if plan not in PLAN_PRICES:
+        raise HTTPException(status_code=400, detail="Invalid plan")
+    cfg = PLAN_PRICES[plan]
+    origin = payload.origin_url.rstrip("/")
+    success_url = f"{origin}/billing/success?session_id={{CHECKOUT_SESSION_ID}}"
+    cancel_url = f"{origin}/billing/cancel"
+
+    try:
+        # Note: Skip pre-creating Stripe Customer — Emergent test proxy has
+        # ephemeral state. Pass customer_email instead; Stripe Checkout will
+        # create or reuse the customer automatically and stripe_customer_id
+        # gets populated on webhook/status callback.
+        session = stripe.checkout.Session.create(
+            customer_email=user["email"],
+            client_reference_id=user["user_id"],
+            mode="subscription",
+            payment_method_types=["card"],
+            line_items=[{
+                "price_data": {
+                    "currency": "usd",
+                    "product_data": {"name": cfg["name"]},
+                    "unit_amount": cfg["amount_cents"],
+                    "recurring": {"interval": "month"},
+                },
+                "quantity": 1,
+            }],
+            success_url=success_url,
+            cancel_url=cancel_url,
+            metadata={
+                "user_id": user["user_id"],
+                "plan": plan,
+                "email": user["email"],
+            },
+            subscription_data={
+                "metadata": {
+                    "user_id": user["user_id"],
+                    "plan": plan,
+                }
+            },
+        )
+
+        await db.payment_transactions.insert_one({
+            "session_id": session.id,
+            "user_id": user["user_id"],
+            "email": user["email"],
+            "plan": plan,
+            "amount_cents": cfg["amount_cents"],
+            "currency": "usd",
+            "payment_status": "initiated",
+            "created_at": iso(now_utc()),
+        })
+        return {"checkout_url": session.url, "session_id": session.id}
+    except stripe.error.StripeError as e:
+        logger.error(f"Stripe checkout failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Stripe error: {str(e)}")
+
+
+@api.get("/stripe/checkout-status/{session_id}")
+async def stripe_checkout_status(session_id: str, user: dict = Depends(get_current_user)):
+    if not STRIPE_API_KEY:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+    txn = await db.payment_transactions.find_one(
+        {"session_id": session_id, "user_id": user["user_id"]}, {"_id": 0}
+    )
+    if not txn:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    try:
+        session = stripe.checkout.Session.retrieve(session_id)
+        await db.payment_transactions.update_one(
+            {"session_id": session_id},
+            {"$set": {
+                "payment_status": session.payment_status,
+                "status": session.status,
+                "subscription_id": getattr(session, "subscription", None),
+                "updated_at": iso(now_utc()),
+            }},
+        )
+        # If paid and not yet processed, activate subscription
+        if session.payment_status == "paid" and txn.get("payment_status") != "paid":
+            await _activate_subscription(user["user_id"], txn["plan"], session.subscription)
+        return {
+            "payment_status": session.payment_status,
+            "status": session.status,
+            "amount_total": session.amount_total,
+            "currency": session.currency,
+        }
+    except stripe.error.StripeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _activate_subscription(user_id: str, plan: str, subscription_id: Optional[str]):
+    cfg = PLAN_PRICES.get(plan)
+    if not cfg:
+        return
+    period_end = None
+    customer_id = None
+    if subscription_id:
+        try:
+            sub = stripe.Subscription.retrieve(subscription_id)
+            period_end = datetime.fromtimestamp(sub.current_period_end, tz=timezone.utc)
+            customer_id = sub.customer
+        except Exception as e:
+            logger.error(f"sub retrieve failed: {e}")
+    if not period_end:
+        period_end = now_utc() + timedelta(days=30)
+    await db.licenses.update_one(
+        {"user_id": user_id},
+        {"$set": {
+            "plan": plan,
+            "status": "active",
+            "expires_at": iso(period_end),
+            "max_activations": cfg["max_activations"],
+            "stripe_subscription_id": subscription_id,
+        }},
+        upsert=True,
+    )
+    if customer_id:
+        await db.users.update_one(
+            {"user_id": user_id},
+            {"$set": {"stripe_customer_id": customer_id}},
+        )
+    user = await db.users.find_one({"user_id": user_id}, {"_id": 0, "password_hash": 0})
+    if user:
+        s, h, t = email_svc.tpl_payment_success(
+            user.get("name", ""), plan, cfg["amount_cents"] / 100,
+            iso(period_end), f"{FRONTEND_URL}/dashboard"
+        )
+        await email_svc.send_email(user["email"], s, h, t)
+
+
+@api.post("/stripe/portal")
+async def stripe_portal(payload: dict, user: dict = Depends(get_current_user)):
+    if not STRIPE_API_KEY:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+    customer_id = user.get("stripe_customer_id")
+    if not customer_id:
+        # Look up most recent paid transaction to find the customer (set on webhook/status)
+        lic = await db.licenses.find_one({"user_id": user["user_id"]}, {"_id": 0})
+        sub_id = lic.get("stripe_subscription_id") if lic else None
+        if sub_id:
+            try:
+                sub = stripe.Subscription.retrieve(sub_id)
+                customer_id = sub.customer
+            except Exception:
+                pass
+    if not customer_id:
+        raise HTTPException(status_code=400, detail="No active subscription")
+    origin = (payload.get("origin_url") or FRONTEND_URL).rstrip("/")
+    try:
+        portal = stripe.billing_portal.Session.create(
+            customer=customer_id,
+            return_url=f"{origin}/dashboard",
+        )
+        return {"url": portal.url}
+    except stripe.error.StripeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api.post("/webhook/stripe")
+async def stripe_webhook(request: Request):
+    payload_bytes = await request.body()
+    sig = request.headers.get("Stripe-Signature", "")
+    # Without webhook secret, we still parse the event (Emergent test mode)
+    webhook_secret = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+    try:
+        if webhook_secret:
+            event = stripe.Webhook.construct_event(payload_bytes, sig, webhook_secret)
+        else:
+            import json
+            event = json.loads(payload_bytes.decode())
+    except Exception as e:
+        logger.error(f"Webhook parse failed: {e}")
+        raise HTTPException(status_code=400, detail="Invalid webhook")
+
+    event_id = event.get("id") if isinstance(event, dict) else event.id
+    event_type = event.get("type") if isinstance(event, dict) else event.type
+    data_obj = (event.get("data", {}) if isinstance(event, dict) else event.data).get("object") or {}
+
+    # Idempotency
+    if event_id and await db.stripe_events.find_one({"event_id": event_id}):
+        return {"ok": True, "duplicate": True}
+    if event_id:
+        await db.stripe_events.insert_one({"event_id": event_id, "type": event_type, "received_at": iso(now_utc())})
+
+    if event_type == "checkout.session.completed":
+        meta = data_obj.get("metadata") or {}
+        user_id = meta.get("user_id")
+        plan = meta.get("plan")
+        sub_id = data_obj.get("subscription")
+        if user_id and plan:
+            await _activate_subscription(user_id, plan, sub_id)
+            await db.payment_transactions.update_one(
+                {"session_id": data_obj.get("id")},
+                {"$set": {"payment_status": "paid", "subscription_id": sub_id}},
+            )
+
+    elif event_type == "invoice.paid":
+        sub_id = data_obj.get("subscription")
+        if sub_id:
+            try:
+                sub = stripe.Subscription.retrieve(sub_id)
+                meta = sub.metadata or {}
+                user_id = meta.get("user_id")
+                plan = meta.get("plan")
+                if user_id and plan:
+                    await _activate_subscription(user_id, plan, sub_id)
+            except Exception as e:
+                logger.error(f"invoice.paid handling failed: {e}")
+
+    elif event_type in ("invoice.payment_failed", "customer.subscription.deleted"):
+        sub_id = data_obj.get("id") if event_type == "customer.subscription.deleted" else data_obj.get("subscription")
+        if sub_id:
+            lic = await db.licenses.find_one({"stripe_subscription_id": sub_id}, {"_id": 0})
+            if lic:
+                # Mark as canceled — keep access until current expires_at
+                await db.licenses.update_one(
+                    {"user_id": lic["user_id"]},
+                    {"$set": {"status": "canceled" if event_type == "customer.subscription.deleted" else "past_due"}},
+                )
+                user = await db.users.find_one({"user_id": lic["user_id"]}, {"_id": 0, "password_hash": 0})
+                if user and event_type == "customer.subscription.deleted":
+                    s, h, t = email_svc.tpl_subscription_canceled(
+                        user.get("name", ""), lic.get("expires_at", ""), f"{FRONTEND_URL}/dashboard"
+                    )
+                    await email_svc.send_email(user["email"], s, h, t)
+
+    return {"ok": True}
+
 
 
 # ---------------- Plans (public) ----------------

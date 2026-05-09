@@ -182,7 +182,7 @@ export default function Landing() {
                       p.id === "pro" ? "btn-primary" : "bg-white/5 hover:bg-white/10 text-white border border-white/20"
                     }`}
                   >
-                    {p.price === 0 ? "Start trial" : "Get " + p.name}
+                    {p.price === 0 ? "Start trial" : "Subscribe to " + p.name}
                   </Button>
                 </Link>
               </div>

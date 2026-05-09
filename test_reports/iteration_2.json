@@ -1,0 +1,42 @@
+{
+  "summary": "Iteration 2 (Resend dry-run + Stripe subscription) tested. Backend: 35/36 pytest passed (15 new email/stripe tests + 21 regression). Frontend: BillingPage cards, Pro 'Current plan' badge, 'Switch to Enterprise' CTA -> redirect to checkout.stripe.com all working; /verify-email?token=invalid shows error state; /billing/cancel renders 'Checkout canceled'. Dry-run email logs verified in backend.err.log ([EMAIL DRY-RUN] welcome, verify, reset, payment-success).",
+  "backend_issues": {
+    "critical": [
+      {
+        "endpoint": "GET /api/stripe/checkout-status/{session_id}",
+        "issue": "Returns HTTP 500 instead of a graceful response when Stripe.Session.retrieve fails. The Emergent test-mode Stripe proxy is ephemeral — sessions created seconds earlier are not retrievable, surfacing as 'No such checkout.session: cs_test_...' StripeError. The except branch maps this to 500. Per review request the endpoint must remain functional and not return 500. Recommend: if Stripe retrieve raises InvalidRequestError ('No such checkout.session'), fall back to returning the cached payment_transactions row (payment_status='unpaid'/'initiated', amount_total/currency from txn) with HTTP 200, or surface 404 with cached snapshot.",
+        "priority": "HIGH"
+      }
+    ],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_email_stripe.py",
+    "/app/backend/tests/test_xss0r_api.py",
+    "/app/test_reports/pytest/iteration_2.xml"
+  ],
+  "action_items": [
+    "Make /api/stripe/checkout-status resilient to Emergent ephemeral session state — catch InvalidRequestError and return cached transaction snapshot instead of 500."
+  ],
+  "critical_code_review_comments": [
+    "server.py is now ~1190 lines — strongly recommend splitting auth, billing/stripe, admin, scans/builds into separate FastAPI routers (>700 line guideline).",
+    "Webhook signature verification is bypassed when STRIPE_WEBHOOK_SECRET is unset — fine for dev but ensure production deploy has the secret set; consider failing closed (reject) when env=='production' and secret is empty.",
+    "stripe_checkout_status surfaces raw stripe error string in HTTP 500 detail — leaks internal request ids; sanitize.",
+    "email_service._initialized + module-level RESEND_API_KEY captured at import time — if the env var changes at runtime, _is_live() still returns False until process restart (acceptable but document)."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_email_stripe.py"
+  ],
+  "success_rate": {"backend": "97% (35/36)", "frontend": "100% (6/6 flows)"},
+  "test_credentials": "user@xss0r.io / User@xss0r2026 (Pro), admin@xss0r.io / Admin@xss0r2026",
+  "seed_data_creation": "Test users with TEST_ prefix created and cleaned up by tests. Demo user license restored to 'pro' after webhook idempotency test (was set to 'enterprise' transiently).",
+  "retest_needed": true,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Run all backend tests: pytest /app/backend/tests/ -v. New file test_email_stripe.py covers register-emails, forgot/verify/resend, checkout pro+enterprise+invalid+unauthed, checkout-status, portal-no-sub, webhook completed+idempotent+invalid. Webhook handler tolerates missing Stripe-Signature when STRIPE_WEBHOOK_SECRET unset. Dry-run logs are emitted to /var/log/supervisor/backend.err.log via [EMAIL DRY-RUN] prefix. Only failing test: test_stripe_checkout_status — root cause is Emergent proxy ephemerality, requires backend hardening of the endpoint.",
+  "rca of the issue": "checkout-status 500: stripe.checkout.Session.retrieve(session_id) raises InvalidRequestError because the Emergent Stripe test proxy does not persist sessions across the brief checkout->status round-trip. server.py:879-900 catches stripe.error.StripeError and re-raises as HTTPException(500). Fix: catch InvalidRequestError specifically, lookup payment_transactions by session_id and return {'payment_status': txn.get('payment_status','unpaid'), 'status': 'open', 'amount_total': txn.get('amount_cents'), 'currency': txn.get('currency','usd')} with HTTP 200. Reproduction: POST /api/stripe/checkout {plan:'pro', origin_url:...} -> capture session_id -> GET /api/stripe/checkout-status/{session_id} -> 500."
+}

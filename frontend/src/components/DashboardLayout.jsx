@@ -3,7 +3,7 @@ import { useAuth } from "../contexts/AuthContext";
 import { Button } from "./ui/button";
 import {
   House, Gauge, Download, Key, Ticket, Users, Package,
-  ChartLine, SignOut, ShieldCheck
+  ChartLine, SignOut, ShieldCheck, CreditCard
 } from "@phosphor-icons/react";
 
 const userLinks = [
@@ -11,6 +11,7 @@ const userLinks = [
   { to: "/dashboard/license", label: "License & API", icon: Key, testid: "nav-license" },
   { to: "/dashboard/downloads", label: "Downloads", icon: Download, testid: "nav-downloads" },
   { to: "/dashboard/scans", label: "Scan History", icon: ChartLine, testid: "nav-scans" },
+  { to: "/dashboard/billing", label: "Billing", icon: CreditCard, testid: "nav-billing" },
   { to: "/dashboard/coupons", label: "Redeem Coupon", icon: Ticket, testid: "nav-coupons" },
 ];
 
