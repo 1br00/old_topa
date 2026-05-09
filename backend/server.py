@@ -718,10 +718,14 @@ async def admin_stats(user: dict = Depends(require_admin)):
 @api.get("/admin/users")
 async def admin_users(user: dict = Depends(require_admin)):
     users = await db.users.find({}, {"_id": 0, "password_hash": 0}).sort("created_at", -1).to_list(500)
-    # attach license info
+    if not users:
+        return users
+    # Batch-fetch licenses to avoid N+1 query
+    user_ids = [u["user_id"] for u in users]
+    licenses = await db.licenses.find({"user_id": {"$in": user_ids}}, {"_id": 0}).to_list(len(user_ids))
+    lic_by_user = {l["user_id"]: l for l in licenses}
     for u in users:
-        lic = await db.licenses.find_one({"user_id": u["user_id"]}, {"_id": 0})
-        u["license"] = lic
+        u["license"] = lic_by_user.get(u["user_id"])
     return users
 
 
