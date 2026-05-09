@@ -34,7 +34,13 @@ export default function PayPalReturn() {
           return;
         }
         setTimeout(poll, 2500);
-      } catch {
+      } catch (err) {
+        const code = err?.response?.status;
+        // Non-retryable errors — fail fast
+        if (code === 400 || code === 404 || code === 503) {
+          setStatus("error");
+          return;
+        }
         if (attempts >= max) setStatus("error");
         else setTimeout(poll, 2500);
       }

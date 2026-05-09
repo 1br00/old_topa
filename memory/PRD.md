@@ -33,6 +33,17 @@ Build a complete SaaS/dashboard system for an XSS scanner tool similar to xss0r.
 - Demo seed: admin, demo user with Pro license + 3 scans + HWID, 2 coupons (LAUNCH50/XSS0R10), 2 build entries
 - 21/21 backend pytest passing; frontend e2e flows verified
 
+## Implemented (2026-02-09 — iteration 3: PayPal subscriptions)
+- **PayPal Subscriptions API integration** (`/app/backend/paypal_service.py`) — direct REST client (no SDK) for sandbox + live:
+  - Auto-creates Product + monthly recurring Plan on demand (cached)
+  - `create_subscription`, `get_subscription`, `cancel_subscription`, `verify_webhook`
+- **Backend endpoints:** `POST /api/paypal/subscribe`, `GET /api/paypal/subscription-status/{id}`, `POST /api/paypal/cancel`, `POST /api/webhook/paypal` (handles BILLING.SUBSCRIPTION.ACTIVATED/CANCELLED/SUSPENDED/EXPIRED, PAYMENT.SALE.COMPLETED/DENIED with idempotency via `paypal_events` collection)
+- **Graceful degradation:** placeholder credentials return HTTP 503 with helpful message, never 500
+- **Frontend BillingPage:** dual buttons per plan — "Pay with card" (Stripe) and "Pay with PayPal" (#0070ba). Cancel button is provider-aware (Stripe portal vs. PayPal API cancel)
+- **`/billing/paypal/return` page** polls subscription status with fail-fast on 4xx/503
+- License doc now tracks `payment_provider` ("stripe" | "paypal") and provider-specific subscription id
+- 46/46 backend tests passing
+
 ## Implemented (2026-02-09 — iteration 2: email + Stripe)
 - **Resend email integration** (`/app/backend/email_service.py`) with templates: password reset, email verification, welcome, payment success, subscription canceled. Async via `asyncio.to_thread`. Falls back to `[EMAIL DRY-RUN]` log when API key is placeholder.
 - **Email verification flow:** `/api/auth/verify-email`, `/api/auth/resend-verification`, frontend `/verify-email?token=...` page
