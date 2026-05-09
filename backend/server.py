@@ -931,6 +931,21 @@ async def admin_wipe_license(user_id: str, user: dict = Depends(require_admin)):
     target = await db.users.find_one({"user_id": user_id}, {"_id": 0})
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
+    lic = await db.licenses.find_one({"user_id": user_id}, {"_id": 0})
+    # Best-effort cancel of upstream subscriptions so admin doesn't keep paying
+    if lic:
+        stripe_sub = lic.get("stripe_subscription_id")
+        if stripe_sub and STRIPE_API_KEY:
+            try:
+                stripe.Subscription.delete(stripe_sub)
+            except Exception as e:
+                logger.warning(f"Stripe cancel on wipe failed: {e}")
+        paypal_sub = lic.get("paypal_subscription_id")
+        if paypal_sub and paypal_svc.is_configured():
+            try:
+                paypal_svc.cancel_subscription(paypal_sub, "Admin wipe")
+            except Exception as e:
+                logger.warning(f"PayPal cancel on wipe failed: {e}")
     await db.licenses.update_one(
         {"user_id": user_id},
         {"$set": {
