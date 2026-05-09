@@ -1,11 +1,15 @@
 import { Link } from "react-router-dom";
 import { Button } from "../components/ui/button";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "../components/ui/dialog";
+import { Input } from "../components/ui/input";
+import { Label } from "../components/ui/label";
 import PlanCard from "../components/PlanCard";
 import { useEffect, useState } from "react";
 import axios from "axios";
 import {
   ShieldCheck, Lightning, Key, Cpu, Code, Terminal,
-  Bug, GitBranch, Lock, ArrowRight, CheckCircle, ListChecks
+  Bug, GitBranch, Lock, ArrowRight, CheckCircle, ListChecks,
+  Ticket, CreditCard
 } from "@phosphor-icons/react";
 import { useNavigate } from "react-router-dom";
 
@@ -13,13 +17,14 @@ const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
 
 export default function Landing() {
   const [plans, setPlans] = useState([]);
+  const [checkoutPlan, setCheckoutPlan] = useState(null);
   const navigate = useNavigate();
 
   useEffect(() => {
     axios.get(`${API}/plans`).then((r) => setPlans(r.data)).catch(() => {});
   }, []);
 
-  const goPlan = (planId) => navigate(`/register?plan=${planId}`);
+  const goPlan = (plan) => setCheckoutPlan(plan);
 
   return (
     <div className="min-h-screen bg-[#0a0a0a] text-[#f0f2f5]">
@@ -161,20 +166,20 @@ export default function Landing() {
           {/* Top row: Basic + Pro */}
           <div className="grid md:grid-cols-2 gap-6 mb-6">
             {plans.slice(0, 2).map((p) => (
-              <PlanCard key={p.id} plan={p} onClick={() => goPlan(p.id)} />
+              <PlanCard key={p.id} plan={p} onClick={() => goPlan(p)} />
             ))}
           </div>
           {/* Mid row: Diamond + Golden */}
           <div className="grid md:grid-cols-2 gap-6 mb-6">
             {plans.slice(2, 4).map((p) => (
-              <PlanCard key={p.id} plan={p} onClick={() => goPlan(p.id)} />
+              <PlanCard key={p.id} plan={p} onClick={() => goPlan(p)} />
             ))}
           </div>
           {/* Bottom: Business centered */}
           <div className="grid md:grid-cols-3 gap-6">
             <div className="hidden md:block" />
             {plans.slice(4, 5).map((p) => (
-              <PlanCard key={p.id} plan={p} onClick={() => goPlan(p.id)} />
+              <PlanCard key={p.id} plan={p} onClick={() => goPlan(p)} />
             ))}
             <div className="hidden md:block" />
           </div>
@@ -207,6 +212,133 @@ export default function Landing() {
           </div>
         </div>
       </footer>
+
+      {checkoutPlan && (
+        <GuestCheckoutDialog plan={checkoutPlan} onClose={() => setCheckoutPlan(null)} />
+      )}
     </div>
+  );
+}
+
+function GuestCheckoutDialog({ plan, onClose }) {
+  const [email, setEmail] = useState("");
+  const [coupon, setCoupon] = useState("");
+  const [couponPreview, setCouponPreview] = useState(null);
+  const [loading, setLoading] = useState(null);
+  const [validating, setValidating] = useState(false);
+
+  const checkCoupon = async () => {
+    if (!coupon.trim()) { setCouponPreview(null); return; }
+    setValidating(true);
+    try {
+      const r = await axios.post(`${API}/coupons/validate`, { code: coupon.trim(), plan: plan.id });
+      setCouponPreview(r.data);
+      toast.success(`${r.data.percent_off}% off applied`);
+    } catch (err) {
+      setCouponPreview(null);
+      toast.error(err?.response?.data?.detail || "Invalid coupon");
+    } finally { setValidating(false); }
+  };
+
+  const subscribe = async (provider) => {
+    if (!email) { toast.error("Email required"); return; }
+    setLoading(provider);
+    const body = { plan: plan.id, origin_url: window.location.origin, guest_email: email };
+    if (couponPreview) body.coupon_code = coupon.trim();
+    try {
+      if (provider === "stripe") {
+        const r = await axios.post(`${API}/stripe/checkout`, body, { withCredentials: true });
+        window.location.href = r.data.checkout_url;
+      } else {
+        const r = await axios.post(`${API}/paypal/subscribe`, body, { withCredentials: true });
+        if (!r.data.approval_url) { toast.error("PayPal not configured"); setLoading(null); return; }
+        window.location.href = r.data.approval_url + `&subscription_id=${r.data.subscription_id}`;
+      }
+    } catch (err) {
+      toast.error(err?.response?.data?.detail || "Checkout failed");
+      setLoading(null);
+    }
+  };
+
+  const finalAmount = couponPreview ? couponPreview.discounted_amount_usd : plan.price;
+
+  return (
+    <Dialog open onOpenChange={onClose}>
+      <DialogContent className="bg-[#0a0a0a] border-white/15 rounded-none max-w-md font-mono" data-testid="guest-checkout-dialog">
+        <DialogHeader>
+          <DialogTitle className="font-mono tracking-tight">
+            Subscribe to <span style={{ color: plan.color }}>{plan.name.toUpperCase()}</span>
+          </DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4 py-2">
+          <div className="border border-white/10 p-4 bg-white/[0.02]">
+            <div className="text-[10px] label-tech">Total today</div>
+            <div className="flex items-baseline gap-2 mt-1">
+              <span className="text-3xl font-bold text-white">${finalAmount}</span>
+              {couponPreview && (
+                <span className="text-sm line-through text-[#737373]">${plan.price}</span>
+              )}
+              <span className="text-xs text-[#a0a6ad] ml-auto">/ {plan.period}, recurring</span>
+            </div>
+          </div>
+
+          <div>
+            <Label className="label-tech">Email address (for receipt + account)</Label>
+            <Input
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="you@company.com"
+              className="rounded-none bg-[#0a0a0a] border-white/15 mt-2 h-11 font-mono"
+              data-testid="guest-email-input"
+            />
+            <p className="text-[10px] text-[#737373] font-mono mt-1.5">
+              We'll create your account and email a password setup link after payment.
+            </p>
+          </div>
+
+          <div>
+            <Label className="label-tech flex items-center gap-1.5"><Ticket size={11} /> Coupon (optional)</Label>
+            <div className="flex gap-2 mt-2">
+              <Input
+                value={coupon}
+                onChange={(e) => setCoupon(e.target.value.toUpperCase())}
+                placeholder="LAUNCH50"
+                className="rounded-none bg-[#0a0a0a] border-white/15 h-10 font-mono uppercase tracking-wider"
+                data-testid="guest-coupon-input"
+              />
+              <Button onClick={checkCoupon} disabled={validating} className="rounded-none h-10 bg-white/5 hover:bg-white/10 border border-white/15 text-white" data-testid="guest-coupon-apply">
+                Apply
+              </Button>
+            </div>
+            {couponPreview && (
+              <p className="text-xs text-[#00d4aa] font-mono mt-2">✓ {couponPreview.percent_off}% discount</p>
+            )}
+          </div>
+        </div>
+        <DialogFooter className="flex-col gap-2 sm:flex-col">
+          <Button
+            onClick={() => subscribe("stripe")}
+            disabled={loading !== null || !email}
+            className="w-full rounded-none h-11 btn-primary"
+            data-testid="guest-stripe-btn"
+          >
+            <CreditCard size={14} className="mr-2" />
+            {loading === "stripe" ? "Redirecting…" : "Pay with card"}
+          </Button>
+          <Button
+            onClick={() => subscribe("paypal")}
+            disabled={loading !== null || !email}
+            className="w-full rounded-none h-11 bg-[#0070ba] hover:bg-[#005a96] text-white"
+            data-testid="guest-paypal-btn"
+          >
+            {loading === "paypal" ? "Redirecting…" : "Pay with PayPal"}
+          </Button>
+          <p className="text-[10px] text-[#737373] font-mono w-full text-center mt-2">
+            Already have an account? <Link to="/login" className="text-[#4da3ff] hover:underline">Sign in</Link> first.
+          </p>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }

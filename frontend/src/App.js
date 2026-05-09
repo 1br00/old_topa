@@ -19,6 +19,8 @@ import AdminStats from "./pages/AdminStats";
 import AdminUsers from "./pages/AdminUsers";
 import AdminCoupons from "./pages/AdminCoupons";
 import AdminBuilds from "./pages/AdminBuilds";
+import AdminPayments from "./pages/AdminPayments";
+import AdminSales from "./pages/AdminSales";
 import BillingPage from "./pages/BillingPage";
 import BillingSuccess from "./pages/BillingSuccess";
 import BillingCancel from "./pages/BillingCancel";
@@ -63,6 +65,8 @@ function AppRouter() {
         <Route path="/admin/users" element={<ProtectedRoute adminOnly><AdminUsers /></ProtectedRoute>} />
         <Route path="/admin/coupons" element={<ProtectedRoute adminOnly><AdminCoupons /></ProtectedRoute>} />
         <Route path="/admin/builds" element={<ProtectedRoute adminOnly><AdminBuilds /></ProtectedRoute>} />
+        <Route path="/admin/payments" element={<ProtectedRoute adminOnly><AdminPayments /></ProtectedRoute>} />
+        <Route path="/admin/sales" element={<ProtectedRoute adminOnly><AdminSales /></ProtectedRoute>} />
       </Routes>
     </>
   );

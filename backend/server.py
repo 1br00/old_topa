@@ -627,6 +627,28 @@ async def my_scans(user: dict = Depends(get_current_user)):
 
 
 # ---------------- Coupons ----------------
+class CouponValidateIn(BaseModel):
+    code: str
+    plan: Optional[str] = None
+
+
+@api.post("/coupons/validate")
+async def coupons_validate(payload: CouponValidateIn):
+    """Public endpoint — preview discount on a given plan before checkout."""
+    coupon = await _fetch_valid_coupon(payload.code)
+    plan = (payload.plan or "").lower()
+    cfg = PLAN_PRICES.get(plan)
+    discounted = _discounted_amount(cfg, coupon) if cfg else None
+    return {
+        "code": coupon["code"],
+        "percent_off": coupon["percent_off"],
+        "valid": True,
+        "discounted_amount_cents": discounted,
+        "discounted_amount_usd": (discounted / 100) if discounted is not None else None,
+        "extends_days": coupon.get("extends_days"),
+    }
+
+
 @api.post("/coupons/redeem")
 async def redeem_coupon(payload: CouponRedeemIn, user: dict = Depends(get_current_user)):
     code = payload.code.strip().upper()
@@ -816,10 +838,428 @@ async def admin_delete_build(build_id: str, user: dict = Depends(require_admin))
     return {"ok": True}
 
 
+# ---------------- Admin: per-user management ----------------
+class AdminUserUpdate(BaseModel):
+    name: Optional[str] = None
+    email: Optional[EmailStr] = None
+    role: Optional[str] = None  # "user" | "admin"
+
+
+class AdminAssignPlan(BaseModel):
+    plan: str  # plan key from PLAN_PRICES
+    duration_days: Optional[int] = None  # default = plan's duration_days
+
+
+class AdminPasswordIn(BaseModel):
+    new_password: str = Field(min_length=6)
+
+
+class AdminContactIn(BaseModel):
+    subject: str = Field(min_length=1, max_length=200)
+    message: str = Field(min_length=1)
+
+
+@api.delete("/admin/users/{user_id}")
+async def admin_delete_user(user_id: str, user: dict = Depends(require_admin)):
+    target = await db.users.find_one({"user_id": user_id}, {"_id": 0})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if target.get("role") == "admin":
+        raise HTTPException(status_code=400, detail="Cannot delete admin user")
+    await db.users.delete_one({"user_id": user_id})
+    await db.licenses.delete_many({"user_id": user_id})
+    await db.api_keys.delete_many({"user_id": user_id})
+    await db.hwid_activations.delete_many({"user_id": user_id})
+    await db.scans.delete_many({"user_id": user_id})
+    await db.user_sessions.delete_many({"user_id": user_id})
+    await db.password_reset_tokens.delete_many({"user_id": user_id})
+    await db.email_verify_tokens.delete_many({"user_id": user_id})
+    return {"ok": True}
+
+
+@api.patch("/admin/users/{user_id}")
+async def admin_update_user(user_id: str, payload: AdminUserUpdate, user: dict = Depends(require_admin)):
+    update = {}
+    if payload.name is not None:
+        update["name"] = payload.name
+    if payload.email is not None:
+        new_email = payload.email.lower()
+        clash = await db.users.find_one({"email": new_email, "user_id": {"$ne": user_id}})
+        if clash:
+            raise HTTPException(status_code=400, detail="Email already in use")
+        update["email"] = new_email
+    if payload.role is not None:
+        if payload.role not in ("user", "admin"):
+            raise HTTPException(status_code=400, detail="Invalid role")
+        update["role"] = payload.role
+    if not update:
+        raise HTTPException(status_code=400, detail="Nothing to update")
+    res = await db.users.update_one({"user_id": user_id}, {"$set": update})
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"ok": True}
+
+
+@api.post("/admin/users/{user_id}/assign-plan")
+async def admin_assign_plan(user_id: str, payload: AdminAssignPlan, user: dict = Depends(require_admin)):
+    plan = payload.plan.lower()
+    if plan not in PLAN_PRICES and plan != "free":
+        raise HTTPException(status_code=400, detail="Invalid plan")
+    target = await db.users.find_one({"user_id": user_id}, {"_id": 0, "password_hash": 0})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    cfg = PLAN_PRICES.get(plan, {})
+    days = payload.duration_days if payload.duration_days is not None else cfg.get("duration_days", 30)
+    expiry = now_utc() + timedelta(days=max(1, days))
+    max_act = cfg.get("max_activations", 1) if plan != "free" else 1
+    await db.licenses.update_one(
+        {"user_id": user_id},
+        {"$set": {
+            "plan": plan,
+            "status": "active",
+            "expires_at": iso(expiry),
+            "max_activations": max_act,
+            "payment_provider": "manual_admin",
+        }},
+        upsert=True,
+    )
+    return {"ok": True, "plan": plan, "expires_at": iso(expiry)}
+
+
+@api.post("/admin/users/{user_id}/wipe-license")
+async def admin_wipe_license(user_id: str, user: dict = Depends(require_admin)):
+    target = await db.users.find_one({"user_id": user_id}, {"_id": 0})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    await db.licenses.update_one(
+        {"user_id": user_id},
+        {"$set": {
+            "plan": "free", "status": "inactive", "expires_at": None,
+            "max_activations": 1,
+        }, "$unset": {
+            "stripe_subscription_id": "", "paypal_subscription_id": "", "payment_provider": "",
+        }},
+        upsert=True,
+    )
+    return {"ok": True}
+
+
+@api.post("/admin/users/{user_id}/set-password")
+async def admin_set_password(user_id: str, payload: AdminPasswordIn, user: dict = Depends(require_admin)):
+    target = await db.users.find_one({"user_id": user_id}, {"_id": 0})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    await db.users.update_one(
+        {"user_id": user_id},
+        {"$set": {"password_hash": hash_password(payload.new_password)}},
+    )
+    return {"ok": True}
+
+
+@api.get("/admin/users/{user_id}/transactions")
+async def admin_user_transactions(user_id: str, user: dict = Depends(require_admin)):
+    txns = await db.payment_transactions.find(
+        {"user_id": user_id}, {"_id": 0}
+    ).sort("created_at", -1).to_list(200)
+    total_paid_cents = sum(
+        t.get("amount_cents", 0) for t in txns
+        if t.get("payment_status") in ("paid", "active")
+    )
+    return {
+        "transactions": txns,
+        "total_spent_cents": total_paid_cents,
+        "total_spent_usd": round(total_paid_cents / 100, 2),
+        "count": len(txns),
+    }
+
+
+@api.post("/admin/users/{user_id}/contact")
+async def admin_contact_user(user_id: str, payload: AdminContactIn, user: dict = Depends(require_admin)):
+    target = await db.users.find_one({"user_id": user_id}, {"_id": 0, "password_hash": 0})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    safe_msg = payload.message.replace("\n", "<br/>")
+    html = f"""<!doctype html><html><body style="background:#0a0a0a;color:#f0f2f5;font-family:sans-serif;padding:40px">
+<table cellpadding=0 cellspacing=0 width=560 style="margin:auto;background:#121212;border:1px solid rgba(255,255,255,.1)">
+<tr><td style="padding:32px"><div style="font-family:monospace;color:#4da3ff;font-weight:700">▣ xss0r support</div>
+<h1 style="font-family:monospace">{payload.subject}</h1>
+<div style="color:#a0a6ad;line-height:1.6;font-size:14px">{safe_msg}</div>
+<hr style="border:0;border-top:1px solid rgba(255,255,255,.1);margin:32px 0"/>
+<p style="font-size:11px;color:#737373;font-family:monospace">— xss0r team</p>
+</td></tr></table></body></html>"""
+    res = await email_svc.send_email(target["email"], payload.subject, html, payload.message)
+    return {"ok": True, "delivery": res}
+
+
+# ---------------- Admin: payments + sales analytics ----------------
+@api.get("/admin/payments/recent")
+async def admin_recent_payments(limit: int = 20, user: dict = Depends(require_admin)):
+    limit = max(1, min(100, limit))
+    txns = await db.payment_transactions.find(
+        {}, {"_id": 0}
+    ).sort("created_at", -1).to_list(limit)
+    user_ids = list({t["user_id"] for t in txns if t.get("user_id")})
+    if user_ids:
+        users = await db.users.find(
+            {"user_id": {"$in": user_ids}}, {"_id": 0, "user_id": 1, "name": 1, "email": 1}
+        ).to_list(len(user_ids))
+        umap = {u["user_id"]: u for u in users}
+        for t in txns:
+            u = umap.get(t.get("user_id")) or {}
+            t["user_name"] = u.get("name")
+            if not t.get("email"):
+                t["email"] = u.get("email")
+    return txns
+
+
+@api.get("/admin/sales/summary")
+async def admin_sales_summary(user: dict = Depends(require_admin)):
+    paid_filter = {"payment_status": {"$in": ["paid", "active"]}}
+    failed_filter = {"payment_status": {"$in": ["failed", "denied"]}}
+
+    total_pipe = [{"$match": paid_filter},
+                  {"$group": {"_id": None, "total": {"$sum": "$amount_cents"}, "count": {"$sum": 1}}}]
+    total_doc = await db.payment_transactions.aggregate(total_pipe).to_list(1)
+    total_cents = total_doc[0]["total"] if total_doc else 0
+    total_count = total_doc[0]["count"] if total_doc else 0
+
+    now = now_utc()
+    day_ago = now - timedelta(days=1)
+    week_ago = now - timedelta(days=7)
+    month_ago = now - timedelta(days=30)
+    year_ago = now - timedelta(days=365)
+
+    async def sum_cents(since: datetime) -> int:
+        pipe = [
+            {"$match": {**paid_filter, "created_at": {"$gte": iso(since)}}},
+            {"$group": {"_id": None, "s": {"$sum": "$amount_cents"}}}
+        ]
+        doc = await db.payment_transactions.aggregate(pipe).to_list(1)
+        return doc[0]["s"] if doc else 0
+
+    revenue_24h = await sum_cents(day_ago)
+    revenue_7d = await sum_cents(week_ago)
+    revenue_30d = await sum_cents(month_ago)
+    revenue_365d = await sum_cents(year_ago)
+
+    series_pipe = [
+        {"$match": {**paid_filter, "created_at": {"$gte": iso(month_ago)}}},
+        {"$project": {"date": {"$substr": ["$created_at", 0, 10]}, "amount_cents": 1}},
+        {"$group": {"_id": "$date", "revenue": {"$sum": "$amount_cents"}, "count": {"$sum": 1}}},
+        {"$sort": {"_id": 1}},
+    ]
+    series_docs = await db.payment_transactions.aggregate(series_pipe).to_list(31)
+    series = [{"date": d["_id"], "revenue_cents": d["revenue"], "count": d["count"]} for d in series_docs]
+
+    prov_pipe = [
+        {"$match": paid_filter},
+        {"$group": {"_id": "$provider", "revenue": {"$sum": "$amount_cents"}, "count": {"$sum": 1}}},
+    ]
+    prov_docs = await db.payment_transactions.aggregate(prov_pipe).to_list(10)
+    by_provider = [{"provider": p["_id"] or "unknown", "revenue_cents": p["revenue"], "count": p["count"]} for p in prov_docs]
+
+    plan_pipe = [
+        {"$match": paid_filter},
+        {"$group": {"_id": "$plan", "revenue": {"$sum": "$amount_cents"}, "count": {"$sum": 1}}},
+    ]
+    plan_docs = await db.payment_transactions.aggregate(plan_pipe).to_list(20)
+    by_plan = [{"plan": p["_id"] or "unknown", "revenue_cents": p["revenue"], "count": p["count"]} for p in plan_docs]
+
+    failed_count = await db.payment_transactions.count_documents(failed_filter)
+
+    return {
+        "total_revenue_cents": total_cents,
+        "total_revenue_usd": round(total_cents / 100, 2),
+        "total_paid_count": total_count,
+        "revenue_24h_cents": revenue_24h,
+        "revenue_7d_cents": revenue_7d,
+        "revenue_30d_cents": revenue_30d,
+        "revenue_365d_cents": revenue_365d,
+        "failed_count": failed_count,
+        "series_daily_30d": series,
+        "by_provider": by_provider,
+        "by_plan": by_plan,
+    }
+
+
+@api.get("/admin/payments/failed")
+async def admin_failed_payments(limit: int = 50, user: dict = Depends(require_admin)):
+    txns = await db.payment_transactions.find(
+        {"payment_status": {"$in": ["failed", "denied"]}}, {"_id": 0}
+    ).sort("created_at", -1).to_list(min(limit, 200))
+    return txns
+
+
+
+
 # ---------------- Stripe subscriptions ----------------
 class CheckoutIn(BaseModel):
     plan: str  # "basic" | "pro" | "diamond" | "golden" | "business"
     origin_url: str  # window.location.origin from frontend
+    coupon_code: Optional[str] = None
+    guest_email: Optional[EmailStr] = None  # for unauthenticated checkout
+
+
+def _validate_coupon(code: str) -> tuple[Optional[dict], int]:
+    """Return (coupon_doc, percent_off). percent_off is 0 if invalid/missing.
+    Used synchronously where async lookup not ideal — caller does the actual fetch."""
+    return None, 0
+
+
+async def _fetch_valid_coupon(code: Optional[str]) -> Optional[dict]:
+    if not code:
+        return None
+    coupon = await db.coupons.find_one({"code": code.strip().upper()}, {"_id": 0})
+    if not coupon:
+        raise HTTPException(status_code=404, detail="Coupon not found")
+    if coupon.get("used_count", 0) >= coupon.get("max_uses", 0):
+        raise HTTPException(status_code=400, detail="Coupon exhausted")
+    if coupon.get("expires_at"):
+        try:
+            exp = datetime.fromisoformat(coupon["expires_at"])
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
+            if exp < now_utc():
+                raise HTTPException(status_code=400, detail="Coupon expired")
+        except Exception:
+            pass
+    return coupon
+
+
+async def _ensure_user_for_purchase(email: str, name: Optional[str] = None) -> dict:
+    """Look up user by email or create a pending account for guest checkout."""
+    email = email.lower()
+    user = await db.users.find_one({"email": email}, {"_id": 0, "password_hash": 0})
+    if user:
+        return user
+    user_id = f"user_{uuid.uuid4().hex[:12]}"
+    temp_password = secrets.token_urlsafe(20)  # user must reset
+    doc = {
+        "user_id": user_id,
+        "email": email,
+        "name": name or email.split("@")[0],
+        "password_hash": hash_password(temp_password),
+        "role": "user",
+        "auth_provider": "purchase",
+        "banned": False,
+        "email_verified": False,
+        "picture": None,
+        "created_at": iso(now_utc()),
+    }
+    await db.users.insert_one(doc)
+    await _ensure_license(user_id, plan="free", days=0)
+    return {k: v for k, v in doc.items() if k != "password_hash"}
+
+
+async def _send_purchase_welcome(user_id: str, email: str, name: str):
+    """Send a welcome+set-password link after a successful guest purchase."""
+    token = secrets.token_urlsafe(32)
+    await db.password_reset_tokens.insert_one({
+        "token": token,
+        "user_id": user_id,
+        "expires_at": now_utc() + timedelta(days=7),
+        "used": False,
+    })
+    setup_link = f"{FRONTEND_URL}/reset-password?token={token}"
+    subject = "Welcome to xss0r — set your password"
+    body = (
+        f"<p>Hi {name},</p><p>Thanks for subscribing to xss0r. Your account is ready.</p>"
+        f"<p>Click the button below to set your password and access your dashboard.</p>"
+    )
+    html = f"""<!doctype html><html><body style="background:#0a0a0a;color:#f0f2f5;font-family:sans-serif;padding:40px">
+<table cellpadding=0 cellspacing=0 width=560 style="margin:auto;background:#121212;border:1px solid rgba(255,255,255,.1)">
+<tr><td style="padding:32px"><div style="font-family:monospace;color:#4da3ff;font-weight:700">▣ xss0r</div>
+<h1 style="font-family:monospace">Welcome to xss0r</h1>{body}
+<a href="{setup_link}" style="background:#4da3ff;color:#0a0a0a;padding:14px 28px;text-decoration:none;font-family:monospace;font-weight:700;display:inline-block;margin:24px 0">Set password</a>
+<p style="font-size:12px;color:#737373">Or paste: {setup_link}</p>
+</td></tr></table></body></html>"""
+    await email_svc.send_email(email, subject, html, f"Set your password: {setup_link}")
+
+
+def _discounted_amount(cfg: dict, coupon: Optional[dict]) -> int:
+    if not coupon:
+        return cfg["amount_cents"]
+    pct = max(0, min(100, int(coupon.get("percent_off", 0))))
+    return int(round(cfg["amount_cents"] * (100 - pct) / 100))
+
+
+@api.post("/stripe/checkout")
+async def stripe_checkout(payload: CheckoutIn, request: Request):
+    if not STRIPE_API_KEY:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+    plan = payload.plan.lower()
+    if plan not in PLAN_PRICES:
+        raise HTTPException(status_code=400, detail="Invalid plan")
+    cfg = PLAN_PRICES[plan]
+    coupon = await _fetch_valid_coupon(payload.coupon_code)
+    amount = _discounted_amount(cfg, coupon)
+    origin = payload.origin_url.rstrip("/")
+    success_url = f"{origin}/billing/success?session_id={{CHECKOUT_SESSION_ID}}"
+    cancel_url = f"{origin}/billing/cancel"
+
+    # Resolve user — auth'd or guest
+    try:
+        user = await get_current_user(request)
+    except HTTPException:
+        if not payload.guest_email:
+            raise HTTPException(status_code=401, detail="Authentication required (or pass guest_email)")
+        user = await _ensure_user_for_purchase(payload.guest_email)
+
+    try:
+        product_name = cfg["name"]
+        if coupon:
+            product_name = f"{cfg['name']} ({coupon['percent_off']}% off — {coupon['code']})"
+        session = stripe.checkout.Session.create(
+            customer_email=user["email"],
+            client_reference_id=user["user_id"],
+            mode="subscription",
+            payment_method_types=["card"],
+            line_items=[{
+                "price_data": {
+                    "currency": "usd",
+                    "product_data": {"name": product_name},
+                    "unit_amount": amount,
+                    "recurring": {
+                        "interval": cfg["interval"],
+                        "interval_count": cfg["interval_count"],
+                    },
+                },
+                "quantity": 1,
+            }],
+            success_url=success_url,
+            cancel_url=cancel_url,
+            metadata={
+                "user_id": user["user_id"],
+                "plan": plan,
+                "email": user["email"],
+                "coupon_code": coupon["code"] if coupon else "",
+            },
+            subscription_data={
+                "metadata": {
+                    "user_id": user["user_id"],
+                    "plan": plan,
+                    "coupon_code": coupon["code"] if coupon else "",
+                }
+            },
+        )
+
+        await db.payment_transactions.insert_one({
+            "provider": "stripe",
+            "session_id": session.id,
+            "user_id": user["user_id"],
+            "email": user["email"],
+            "plan": plan,
+            "amount_cents": amount,
+            "original_amount_cents": cfg["amount_cents"],
+            "coupon_code": coupon["code"] if coupon else None,
+            "currency": "usd",
+            "payment_status": "initiated",
+            "created_at": iso(now_utc()),
+        })
+        return {"checkout_url": session.url, "session_id": session.id}
+    except stripe.error.StripeError as e:
+        logger.error(f"Stripe checkout failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Stripe error: {str(e)}")
 
 
 def _ensure_stripe_customer(user: dict) -> str:
@@ -839,71 +1279,6 @@ def _ensure_stripe_customer(user: dict) -> str:
         metadata={"user_id": user["user_id"]},
     )
     return cust.id
-
-
-@api.post("/stripe/checkout")
-async def stripe_checkout(payload: CheckoutIn, user: dict = Depends(get_current_user)):
-    if not STRIPE_API_KEY:
-        raise HTTPException(status_code=500, detail="Stripe not configured")
-    plan = payload.plan.lower()
-    if plan not in PLAN_PRICES:
-        raise HTTPException(status_code=400, detail="Invalid plan")
-    cfg = PLAN_PRICES[plan]
-    origin = payload.origin_url.rstrip("/")
-    success_url = f"{origin}/billing/success?session_id={{CHECKOUT_SESSION_ID}}"
-    cancel_url = f"{origin}/billing/cancel"
-
-    try:
-        # Note: Skip pre-creating Stripe Customer — Emergent test proxy has
-        # ephemeral state. Pass customer_email instead; Stripe Checkout will
-        # create or reuse the customer automatically and stripe_customer_id
-        # gets populated on webhook/status callback.
-        session = stripe.checkout.Session.create(
-            customer_email=user["email"],
-            client_reference_id=user["user_id"],
-            mode="subscription",
-            payment_method_types=["card"],
-            line_items=[{
-                "price_data": {
-                    "currency": "usd",
-                    "product_data": {"name": cfg["name"]},
-                    "unit_amount": cfg["amount_cents"],
-                    "recurring": {
-                        "interval": cfg["interval"],
-                        "interval_count": cfg["interval_count"],
-                    },
-                },
-                "quantity": 1,
-            }],
-            success_url=success_url,
-            cancel_url=cancel_url,
-            metadata={
-                "user_id": user["user_id"],
-                "plan": plan,
-                "email": user["email"],
-            },
-            subscription_data={
-                "metadata": {
-                    "user_id": user["user_id"],
-                    "plan": plan,
-                }
-            },
-        )
-
-        await db.payment_transactions.insert_one({
-            "session_id": session.id,
-            "user_id": user["user_id"],
-            "email": user["email"],
-            "plan": plan,
-            "amount_cents": cfg["amount_cents"],
-            "currency": "usd",
-            "payment_status": "initiated",
-            "created_at": iso(now_utc()),
-        })
-        return {"checkout_url": session.url, "session_id": session.id}
-    except stripe.error.StripeError as e:
-        logger.error(f"Stripe checkout failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Stripe error: {str(e)}")
 
 
 @api.get("/stripe/checkout-status/{session_id}")
@@ -1052,12 +1427,23 @@ async def stripe_webhook(request: Request):
         user_id = meta.get("user_id")
         plan = meta.get("plan")
         sub_id = data_obj.get("subscription")
+        coupon_code = (meta.get("coupon_code") or "").strip().upper()
         if user_id and plan:
             await _activate_subscription(user_id, plan, sub_id)
             await db.payment_transactions.update_one(
                 {"session_id": data_obj.get("id")},
-                {"$set": {"payment_status": "paid", "subscription_id": sub_id}},
+                {"$set": {"payment_status": "paid", "subscription_id": sub_id,
+                          "paid_at": iso(now_utc())}},
             )
+            if coupon_code:
+                await db.coupons.update_one({"code": coupon_code}, {"$inc": {"used_count": 1}})
+            # If user was created via guest checkout (auth_provider="purchase" + no email_verified)
+            user = await db.users.find_one({"user_id": user_id}, {"_id": 0, "password_hash": 0})
+            if user and user.get("auth_provider") == "purchase" and not user.get("email_verified"):
+                try:
+                    await _send_purchase_welcome(user_id, user["email"], user.get("name", ""))
+                except Exception as e:
+                    logger.error(f"purchase welcome email failed: {e}")
 
     elif event_type == "invoice.paid":
         sub_id = data_obj.get("subscription")
@@ -1077,7 +1463,20 @@ async def stripe_webhook(request: Request):
         if sub_id:
             lic = await db.licenses.find_one({"stripe_subscription_id": sub_id}, {"_id": 0})
             if lic:
-                # Mark as canceled — keep access until current expires_at
+                # Record failed transaction for analytics
+                if event_type == "invoice.payment_failed":
+                    await db.payment_transactions.insert_one({
+                        "provider": "stripe",
+                        "user_id": lic["user_id"],
+                        "email": (await db.users.find_one({"user_id": lic["user_id"]}, {"email": 1}) or {}).get("email"),
+                        "plan": lic.get("plan"),
+                        "amount_cents": data_obj.get("amount_due", 0),
+                        "currency": data_obj.get("currency", "usd"),
+                        "payment_status": "failed",
+                        "failure_reason": data_obj.get("last_payment_error", {}).get("message") if isinstance(data_obj.get("last_payment_error"), dict) else "card_declined",
+                        "subscription_id": sub_id,
+                        "created_at": iso(now_utc()),
+                    })
                 await db.licenses.update_one(
                     {"user_id": lic["user_id"]},
                     {"$set": {"status": "canceled" if event_type == "customer.subscription.deleted" else "past_due"}},
@@ -1097,10 +1496,12 @@ async def stripe_webhook(request: Request):
 class PayPalSubscribeIn(BaseModel):
     plan: str  # "basic" | "pro" | "diamond" | "golden" | "business"
     origin_url: str
+    coupon_code: Optional[str] = None
+    guest_email: Optional[EmailStr] = None
 
 
 @api.post("/paypal/subscribe")
-async def paypal_subscribe(payload: PayPalSubscribeIn, user: dict = Depends(get_current_user)):
+async def paypal_subscribe(payload: PayPalSubscribeIn, request: Request):
     if not paypal_svc.is_configured():
         raise HTTPException(
             status_code=503,
@@ -1109,10 +1510,19 @@ async def paypal_subscribe(payload: PayPalSubscribeIn, user: dict = Depends(get_
     plan = payload.plan.lower()
     if plan not in PLAN_PRICES:
         raise HTTPException(status_code=400, detail="Invalid plan")
+    coupon = await _fetch_valid_coupon(payload.coupon_code)
     origin = payload.origin_url.rstrip("/")
+
+    try:
+        user = await get_current_user(request)
+    except HTTPException:
+        if not payload.guest_email:
+            raise HTTPException(status_code=401, detail="Authentication required (or pass guest_email)")
+        user = await _ensure_user_for_purchase(payload.guest_email)
+
     return_url = f"{origin}/billing/paypal/return?plan={plan}"
     cancel_url = f"{origin}/billing/cancel"
-    custom_id = f"{user['user_id']}|{plan}"
+    custom_id = f"{user['user_id']}|{plan}|{coupon['code'] if coupon else ''}"
     try:
         result = paypal_svc.create_subscription(
             plan_key=plan,
@@ -1133,13 +1543,17 @@ async def paypal_subscribe(payload: PayPalSubscribeIn, user: dict = Depends(get_
         logger.error(f"PayPal create subscription error: {e}")
         raise HTTPException(status_code=502, detail="PayPal unavailable")
 
+    cfg = PLAN_PRICES[plan]
+    amount = _discounted_amount(cfg, coupon)
     await db.payment_transactions.insert_one({
         "provider": "paypal",
         "subscription_id": result["subscription_id"],
         "user_id": user["user_id"],
         "email": user["email"],
         "plan": plan,
-        "amount_cents": PLAN_PRICES[plan]["amount_cents"],
+        "amount_cents": amount,
+        "original_amount_cents": cfg["amount_cents"],
+        "coupon_code": coupon["code"] if coupon else None,
         "currency": "usd",
         "payment_status": "initiated",
         "created_at": iso(now_utc()),
@@ -1271,10 +1685,24 @@ async def paypal_webhook(request: Request):
     if event_type in ("BILLING.SUBSCRIPTION.ACTIVATED", "BILLING.SUBSCRIPTION.CREATED"):
         sub_id = resource.get("id")
         custom_id = resource.get("custom_id", "")
-        if "|" in custom_id:
-            user_id, plan = custom_id.split("|", 1)
-            if sub_id and user_id and plan in PLAN_PRICES:
-                await _activate_paypal_subscription(user_id, plan, sub_id, resource)
+        parts = custom_id.split("|")
+        user_id = parts[0] if len(parts) > 0 else ""
+        plan = parts[1] if len(parts) > 1 else ""
+        coupon_code = (parts[2] if len(parts) > 2 else "").strip().upper()
+        if sub_id and user_id and plan in PLAN_PRICES:
+            await _activate_paypal_subscription(user_id, plan, sub_id, resource)
+            await db.payment_transactions.update_one(
+                {"subscription_id": sub_id},
+                {"$set": {"payment_status": "active", "paid_at": iso(now_utc())}},
+            )
+            if coupon_code:
+                await db.coupons.update_one({"code": coupon_code}, {"$inc": {"used_count": 1}})
+            user = await db.users.find_one({"user_id": user_id}, {"_id": 0, "password_hash": 0})
+            if user and user.get("auth_provider") == "purchase" and not user.get("email_verified"):
+                try:
+                    await _send_purchase_welcome(user_id, user["email"], user.get("name", ""))
+                except Exception as e:
+                    logger.error(f"purchase welcome email (paypal) failed: {e}")
 
     elif event_type == "PAYMENT.SALE.COMPLETED":
         # Extend license on each successful renewal

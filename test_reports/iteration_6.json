@@ -1,0 +1,47 @@
+{
+  "summary": "Iteration 6 — Big admin panel expansion fully tested. Backend: 28/28 NEW tests in test_admin_expansion.py pass (coupons/validate, guest checkout w/auto-create user, admin users delete/patch/assign-plan/wipe-license/set-password/transactions/contact, admin payments recent + sales summary + failed payments, 403 enforcement for non-admin, Stripe webhook coupon used_count increment, Stripe webhook invoice.payment_failed creates failed txn). Regression suite 52/53 (1 pre-existing test_paypal_subscribe_unauthed expects 401 but PayPal placeholder returns 503 first — that's a code-ordering issue that existed before iteration 6). Frontend: /admin/users (Actions dropdown column visible, 61 users), /admin/payments (auto-refresh ON badge, table with status badges + provider + LAUNCH50 coupon + time-ago), /admin/sales (KPI cards $3,479.75/$209.97/$1,119.92 + 27 paid + 3 failed + daily revenue chart + Stripe vs PayPal pie + revenue-by-plan bar chart all rendering). Sidebar shows Payments + Sales. Dashboard /billing has coupon section + Apply button. CRITICAL FRONTEND BUG FOUND AND FIXED: GuestCheckoutDialog crashed with 'Dialog is not defined' + 'Ticket is not defined' — Landing.jsx was missing imports for Dialog/DialogContent/DialogHeader/DialogTitle/DialogFooter/Input/Label and the Ticket+CreditCard icons. After fix, dialog opens correctly with email field, coupon input, total price ($19.99), and Pay with card / Pay with PayPal buttons.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/paypal/subscribe", "issue": "Returns 503 (placeholder not configured) BEFORE running auth check — pre-existing test_paypal_subscribe_unauthed in test_paypal.py expects 401 and now fails. When PayPal is configured this test will pass. Acceptable in placeholder mode but worth noting that auth bypass logic is not exercised today. Not introduced by iteration 6."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "Landing.jsx GuestCheckoutDialog", "issue": "[FIXED by testing agent] Missing imports — Dialog/DialogContent/DialogHeader/DialogTitle/DialogFooter from components/ui/dialog, Input from components/ui/input, Label from components/ui/label, plus Ticket+CreditCard from @phosphor-icons/react. Caused full uncaught runtime error 'Dialog is not defined' / 'Ticket is not defined' the moment a user clicked any Select button on the landing page — 100% blocking guest checkout flow.", "selector": "[data-testid=\"guest-checkout-dialog\"]", "priority": "CRITICAL (resolved)"}
+    ],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_admin_expansion.py",
+    "/app/test_reports/pytest/iteration_6.xml"
+  ],
+  "action_items": [
+    "[VERIFIED FIXED] Landing.jsx now has correct imports — main agent should review the import block I added (lines 1-12) and confirm no other icons are missing as more features are added.",
+    "[LOW carry-over from iteration 5] _activate_paypal_subscription still hardcodes 30-day fallback for missing next_billing_time — fix duration_days plan-aware (only triggers if PayPal is configured + webhook delivered without next_billing_time).",
+    "[LOW] PayPal endpoint ordering: when configured, the 503 short-circuit moves out of the way and 401-vs-guest_email path will be exercised.",
+    "[LOW] server.py is now ~1980 lines — strongly recommend splitting into routers (auth, stripe, paypal, admin, plans, coupons, builds) per >700 line guideline."
+  ],
+  "critical_code_review_comments": [
+    "Landing.jsx had no lint/CI step that would have caught the missing imports — recommend adding ESLint react/jsx-no-undef rule (which would have caught 'Dialog is not defined' at build time). Currently CRA build does not fail on unresolved JSX identifiers.",
+    "_fetch_valid_coupon raises 404 even on internal calls from /coupons/validate — that is the test contract, but means stripe_checkout will also raise 404 if coupon is bad rather than treating it as 'no discount'. Acceptable but consider whether silent fallback would be friendlier for guest checkout.",
+    "admin_wipe_license uses $unset for stripe/paypal_subscription_id but does NOT cancel the underlying Stripe/PayPal subscription — admin will keep getting recurring payments that no longer attach to a license. Consider calling stripe.Subscription.delete + paypal_svc.cancel_subscription before unsetting.",
+    "_ensure_user_for_purchase generates a temp password but never communicates it; user MUST go through the password setup email which is only triggered post-payment (in webhook). If webhook fails the user has no way to access the account — consider also sending the welcome+set-password mail at guest signup or making temp_password=None a flag.",
+    "Sales summary: series_daily_30d uses string-based date grouping via $substr on ISO created_at. This will silently break if ever a non-ISO timestamp is stored. Mongo $dateFromString + $dateToString would be safer."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_admin_expansion.py (NEW, 28 tests)",
+    "/app/frontend/src/pages/Landing.jsx (added missing imports — Dialog*, Input, Label, Ticket, CreditCard)"
+  ],
+  "success_rate": {
+    "backend": "100% on iteration-6 surface (28/28). 98.1% overall (52/53 regression — 1 pre-existing PayPal placeholder/auth ordering).",
+    "frontend": "100% after fixing the Landing.jsx import bug — admin Users/Payments/Sales pages, Billing coupon, Guest checkout dialog all verified visually."
+  },
+  "test_credentials": "admin@xss0r.io / Admin@xss0r2026 (admin), user@xss0r.io / User@xss0r2026 (pro). Demo coupons LAUNCH50 (50%) + XSS0R10 (10%) seeded.",
+  "seed_data_creation": "test_admin_expansion.py creates ephemeral users (tmp_/del_/cp_/wh_/guest_/pp_ prefixes) — temp_user fixture cleans up via admin DELETE. test_stripe_webhook_coupon_increments_used_count permanently increments LAUNCH50 used_count by 1 each run (acceptable for a test coupon with max_uses=100).",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Iteration 6 backend admin expansion is solid and fully covered by test_admin_expansion.py. The one critical frontend regression (Landing.jsx missing imports) was found and fixed by this testing agent. Re-run all backend tests with: pytest backend/tests/. PayPal-related tests will continue to return 503 until PAYPAL_CLIENT_ID/SECRET are populated — expected. Still on backlog: server.py refactor (1980 lines), iteration-5 PayPal _activate_subscription duration_days fix.",
+  "rca of the issue": "RCA — Critical FE bug: Landing.jsx GuestCheckoutDialog component referenced Dialog/DialogContent/DialogHeader/DialogTitle/DialogFooter (shadcn), Input, Label and the icons Ticket + CreditCard but none of these were imported. ReproSteps: 1) navigate to /, 2) scroll to pricing, 3) click any 'Select' button → React renders <GuestCheckoutDialog /> → ReferenceError: Dialog is not defined. Mitigation: Added the missing imports at the top of Landing.jsx (Dialog* from ../components/ui/dialog, Input from ../components/ui/input, Label from ../components/ui/label) and added Ticket, CreditCard to the @phosphor-icons/react named import. Verified post-fix screenshot: dialog opens with TOTAL TODAY $19.99, email field, LAUNCH50 coupon prefilled, Apply button, Pay with card + Pay with PayPal buttons. Long-term mitigation: enable ESLint react/jsx-no-undef and `react/react-in-jsx-scope` rules in CRA build."
+}

@@ -3,7 +3,7 @@ import { useAuth } from "../contexts/AuthContext";
 import { Button } from "./ui/button";
 import {
   House, Gauge, Download, Key, Ticket, Users, Package,
-  ChartLine, SignOut, ShieldCheck, CreditCard
+  ChartLine, SignOut, ShieldCheck, CreditCard, Receipt, ChartBar
 } from "@phosphor-icons/react";
 
 const userLinks = [
@@ -20,6 +20,8 @@ const adminLinks = [
   { to: "/admin/users", label: "Users", icon: Users, testid: "nav-admin-users" },
   { to: "/admin/coupons", label: "Coupons", icon: Ticket, testid: "nav-admin-coupons" },
   { to: "/admin/builds", label: "Builds", icon: Package, testid: "nav-admin-builds" },
+  { to: "/admin/payments", label: "Payments", icon: Receipt, testid: "nav-admin-payments" },
+  { to: "/admin/sales", label: "Sales", icon: ChartBar, testid: "nav-admin-sales" },
 ];
 
 export default function DashboardLayout({ children, mode = "user" }) {
