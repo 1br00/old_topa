@@ -48,6 +48,11 @@ JWT_SECRET = os.environ["JWT_SECRET"]
 JWT_ALG = "HS256"
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@xss0r.io")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "Admin@xss0r2026")
+ADMIN_EMAILS = {
+    e.strip().lower()
+    for e in os.environ.get("ADMIN_EMAILS", ADMIN_EMAIL).split(",")
+    if e.strip()
+}
 EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY", "")
 APP_NAME = os.environ.get("APP_NAME", "xss0r-saas")
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "")
@@ -548,6 +553,7 @@ async def google_session(payload: GoogleSessionIn, response: Response):
         raise HTTPException(status_code=400, detail="No email returned")
 
     user = await db.users.find_one({"email": email})
+    desired_role = "admin" if email in ADMIN_EMAILS else "user"
     if not user:
         user_id = f"user_{uuid.uuid4().hex[:12]}"
         user = {
@@ -555,22 +561,28 @@ async def google_session(payload: GoogleSessionIn, response: Response):
             "email": email,
             "name": data.get("name") or email.split("@")[0],
             "picture": data.get("picture"),
-            "role": "user",
+            "role": desired_role,
             "auth_provider": "google",
             "banned": False,
             "created_at": iso(now_utc()),
         }
         await db.users.insert_one(user)
-        await _ensure_license(user_id, plan="free", days=14)
+        # Admins get an effectively unlimited license; regular users get 14d trial
+        if desired_role == "admin":
+            await _ensure_license(user_id, plan="business", days=3650)
+        else:
+            await _ensure_license(user_id, plan="free", days=14)
     else:
         if user.get("banned"):
             raise HTTPException(status_code=403, detail="Account banned")
-        await db.users.update_one({"user_id": user["user_id"]}, {
-            "$set": {
-                "name": data.get("name") or user.get("name"),
-                "picture": data.get("picture") or user.get("picture"),
-            }
-        })
+        update = {
+            "name": data.get("name") or user.get("name"),
+            "picture": data.get("picture") or user.get("picture"),
+        }
+        # Auto-promote whitelisted emails on every login (defense in depth)
+        if email in ADMIN_EMAILS and user.get("role") != "admin":
+            update["role"] = "admin"
+        await db.users.update_one({"user_id": user["user_id"]}, {"$set": update})
 
     session_token = data.get("session_token") or secrets.token_urlsafe(32)
     await db.user_sessions.insert_one({
@@ -1863,7 +1875,7 @@ async def get_plans():
 
 # ---------------- Seeding ----------------
 async def seed_demo():
-    # admin
+    # admin (password-based)
     admin = await db.users.find_one({"email": ADMIN_EMAIL})
     if admin is None:
         admin_id = f"user_{uuid.uuid4().hex[:12]}"
@@ -1885,6 +1897,31 @@ async def seed_demo():
                 {"email": ADMIN_EMAIL},
                 {"$set": {"password_hash": hash_password(ADMIN_PASSWORD), "role": "admin", "banned": False}},
             )
+
+    # Whitelist Google-only admins (login via "Continue with Google")
+    for whitelisted_email in ADMIN_EMAILS:
+        if whitelisted_email == ADMIN_EMAIL.lower():
+            continue
+        existing = await db.users.find_one({"email": whitelisted_email})
+        if existing is None:
+            uid = f"user_{uuid.uuid4().hex[:12]}"
+            await db.users.insert_one({
+                "user_id": uid,
+                "email": whitelisted_email,
+                "name": whitelisted_email.split("@")[0],
+                "role": "admin",
+                "auth_provider": "google",
+                "banned": False,
+                "created_at": iso(now_utc()),
+                # No password_hash — must log in via Google
+            })
+            await _ensure_license(uid, plan="business", days=3650)
+            logger.info(f"Seeded Google-admin {whitelisted_email}")
+        elif existing.get("role") != "admin":
+            await db.users.update_one(
+                {"email": whitelisted_email}, {"$set": {"role": "admin", "banned": False}}
+            )
+            logger.info(f"Promoted {whitelisted_email} to admin")
 
     # demo user
     test_email = "user@xss0r.io"
