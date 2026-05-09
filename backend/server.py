@@ -896,8 +896,21 @@ async def stripe_checkout_status(session_id: str, user: dict = Depends(get_curre
             "amount_total": session.amount_total,
             "currency": session.currency,
         }
+    except stripe.error.InvalidRequestError as e:
+        # Emergent test proxy is ephemeral — session may not be retrievable.
+        # Fall back to cached transaction snapshot so the UI can keep polling
+        # gracefully without a 500 error.
+        logger.warning(f"Stripe session {session_id} not retrievable, returning cached: {e}")
+        return {
+            "payment_status": txn.get("payment_status", "unpaid"),
+            "status": txn.get("status", "open"),
+            "amount_total": txn.get("amount_cents", 0),
+            "currency": txn.get("currency", "usd"),
+            "cached": True,
+        }
     except stripe.error.StripeError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Stripe checkout-status error for {session_id}: {e}")
+        raise HTTPException(status_code=502, detail="Payment provider unavailable")
 
 
 async def _activate_subscription(user_id: str, plan: str, subscription_id: Optional[str]):

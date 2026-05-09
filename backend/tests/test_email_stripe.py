@@ -156,18 +156,45 @@ def test_stripe_checkout_unauthed():
     assert r.status_code == 401
 
 
-# -------- Stripe checkout-status --------
-def test_stripe_checkout_status(user_s):
-    # Create a session first to get a real session_id
+# -------- Stripe checkout-status (Pro) - must NEVER be 500 --------
+def test_stripe_checkout_status_pro(user_s):
+    # Create a Pro session and immediately query status
     r = user_s.post(f"{BASE}/api/stripe/checkout", json={"plan": "pro", "origin_url": BASE})
     assert r.status_code == 200
     sid = r.json()["session_id"]
     r2 = user_s.get(f"{BASE}/api/stripe/checkout-status/{sid}")
-    assert r2.status_code == 200, r2.text
+    # Critical: must be 200, never 500
+    assert r2.status_code == 200, f"Expected 200, got {r2.status_code}: {r2.text}"
     d = r2.json()
     assert "payment_status" in d
-    # likely "unpaid" since no real payment
-    assert d["payment_status"] in ("unpaid", "paid", "no_payment_required", "open")
+    assert "status" in d
+    assert "amount_total" in d
+    assert "currency" in d
+    assert d["payment_status"] in ("unpaid", "paid", "no_payment_required", "open", "initiated")
+    # If Stripe ephemeral proxy returned cached fallback, it should be flagged
+    if d.get("cached") is True:
+        assert d["currency"] in ("usd", "USD")
+        # cached snapshot from initiated txn should preserve plan amount
+        assert d["amount_total"] is not None
+
+
+# -------- Stripe checkout-status (Enterprise) - must NEVER be 500 --------
+def test_stripe_checkout_status_enterprise(user_s):
+    r = user_s.post(f"{BASE}/api/stripe/checkout", json={"plan": "enterprise", "origin_url": BASE})
+    assert r.status_code == 200
+    sid = r.json()["session_id"]
+    r2 = user_s.get(f"{BASE}/api/stripe/checkout-status/{sid}")
+    assert r2.status_code == 200, f"Expected 200, got {r2.status_code}: {r2.text}"
+    d = r2.json()
+    assert "payment_status" in d
+    assert d["payment_status"] in ("unpaid", "paid", "no_payment_required", "open", "initiated")
+
+
+# -------- Stripe checkout-status: 404 for unknown session_id --------
+def test_stripe_checkout_status_unknown_session_returns_404(user_s):
+    fake_sid = "cs_test_doesnotexist_" + uuid.uuid4().hex[:12]
+    r = user_s.get(f"{BASE}/api/stripe/checkout-status/{fake_sid}")
+    assert r.status_code == 404, f"Expected 404 for unknown session, got {r.status_code}: {r.text}"
 
 
 # -------- Stripe portal: 400 when no subscription on demo user --------
